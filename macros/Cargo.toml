@@ -1,16 +1,14 @@
-[workspace]
-members = ["macros"]
-
 [package]
-name = "zerialize"
-description = "Zero-copy serialization"
+name = "zerialize-macros"
+description = "Procedural macros for zerialize"
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT OR Apache-2.0"
-readme = "README.md"
 repository = "https://github.com/cberner/zerialize"
 authors = ["Christopher Berner <me@cberner.com>"]
 
+[lib]
+proc-macro = true
+
 [dependencies]
-zerialize-macros = { version = "0.0.0", path = "macros" }

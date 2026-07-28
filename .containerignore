@@ -12,6 +12,8 @@
 !docs/**
 !examples/
 !examples/**
+!macros/
+!macros/**
 !justfile
 !rust-toolchain
 !src/
