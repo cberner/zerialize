@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  pull_request:
+  push: # required for actions/cache to work
+    branches:
+      - master
+
+jobs:
+  ci:
+    strategy:
+      matrix:
+        os: ["ubuntu-latest"]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache
+        id: rust-cache
+        uses: actions/cache@v5
+        with:
+            path: |
+                ~/.cargo/bin/cargo-deny
+                ~/.cargo/bin/cargo-deny.exe
+                ~/.cargo/bin/cargo-fuzz
+                ~/.cargo/bin/cargo-fuzz.exe
+                ~/.cargo/bin/just
+                ~/.cargo/bin/just.exe
+                ~/.cargo/registry/index/
+                ~/.cargo/registry/cache/
+                ~/.cargo/git/db/
+                target/.rustc_info.json
+                target/debug/.fingerprint/
+                target/debug/build/
+                target/debug/deps/
+                fuzz/target/
+            key: ${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.toml', '.github/workflows/*.yml', 'rust-toolchain') }}
+            restore-keys: |
+                ${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Non ASCII characters
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+            if grep -P -n "[^\x00-\x7F]" -r --include="*.rs" --include="*.toml" .; then
+            echo "Non-ASCII characters detected"
+            exit 1
+            fi
+
+      - name: Install Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust
+        run: |
+            rustup component add rustfmt
+            rustup component add clippy
+
+      - name: Install cargo-deny
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        run: cargo install --force --version 0.20.2 cargo-deny --locked
+
+      - name: Install just
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        run: cargo install --force --version 1.36.0 just --locked
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (default features)
+        run: cargo clippy --all --all-targets -- -Dwarnings
+
+      - name: Run tests
+        run: just test_no_sandbox
+
+  coverage:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-llvm-cov
+        run: |
+            rustup component add llvm-tools-preview
+            cargo install --force --version 0.8.5 cargo-llvm-cov --locked
+      - name: Generate coverage report
+        run: cargo llvm-cov --all-features --lcov --output-path lcov.info
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          use_oidc: true

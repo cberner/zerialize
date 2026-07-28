@@ -1,0 +1,12 @@
+[package]
+name = "zerialize"
+description = "Zero-copy serialization"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/cberner/zerialize"
+authors = ["Christopher Berner <me@cberner.com>"]
+
+[dependencies]
