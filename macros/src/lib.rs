@@ -5,15 +5,13 @@
 
 #![forbid(unsafe_code)]
 
-use proc_macro::{Delimiter, Group, Span, TokenStream, TokenTree};
-use std::fmt::Write as _;
-
-/// Appends a line of generated source to a `String`.
-macro_rules! emit {
-    ($out:expr, $($arg:tt)*) => {
-        writeln!($out, $($arg)*).expect("writing to a String cannot fail")
-    };
-}
+use proc_macro2::{Literal, TokenStream};
+use quote::{ToTokens, format_ident, quote};
+use syn::{
+    Attribute, Error, FnArg, GenericArgument, Ident, Item, ItemTrait, LitInt, Path, PathArguments,
+    PathSegment, ReceiverKind, ReturnType, Safety, Signature, TraitBound, TraitItem, TraitItemFn,
+    Type, TypeImplTrait, TypeParamBound, TypePath, Visibility, WherePredicate,
+};
 
 /// Turns a trait into a zero-copy serialization schema.
 ///
@@ -36,79 +34,102 @@ macro_rules! emit {
 /// so they must be declared `where Self: Sized` to keep `dyn Trait` usable as
 /// the schema's name.
 #[proc_macro_attribute]
-pub fn zerializable(args: TokenStream, item: TokenStream) -> TokenStream {
+pub fn zerializable(
+    args: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    let mut item = match parse_trait(item) {
+        Ok(item) => item,
+        Err(error) => return error.to_compile_error().into(),
+    };
+    let expansion = expand(args.into(), &item);
     // `#[slot(N)]` is consumed here, so it must be stripped from the trait even
     // when the rest of the expansion fails, or the reported error would be a
     // confusing "cannot find attribute `slot`".
-    let mut output = strip_slot_attributes(item.clone());
-    match expand(args, item) {
-        Ok(generated) => output.extend(generated),
-        Err(error) => output.extend(error.into_tokens()),
-    }
-    output
+    strip_slot_attributes(&mut item);
+    let mut output = item.into_token_stream();
+    output.extend(match expansion {
+        Ok(generated) => generated,
+        Err(error) => error.to_compile_error(),
+    });
+    output.into()
 }
 
-fn expand(args: TokenStream, item: TokenStream) -> Result<TokenStream, Error> {
-    if let Some(token) = args.into_iter().next() {
-        return Err(Error::new(
-            token.span(),
+fn parse_trait(item: proc_macro::TokenStream) -> Result<ItemTrait, Error> {
+    match syn::parse(item)? {
+        Item::Trait(item) => Ok(item),
+        other => Err(Error::new_spanned(
+            other,
+            "#[zerializable] may only be applied to a trait",
+        )),
+    }
+}
+
+fn expand(args: TokenStream, item: &ItemTrait) -> Result<TokenStream, Error> {
+    if !args.is_empty() {
+        return Err(Error::new_spanned(
+            args,
             "#[zerializable] does not take any arguments",
         ));
     }
-    let schema = parse_schema(&item.into_iter().collect::<Vec<_>>())?;
-    Ok(generate(&schema)
-        .parse()
-        .expect("generated code is valid Rust"))
+    Ok(generate(&parse_schema(item)?))
+}
+
+fn strip_slot_attributes(item: &mut ItemTrait) {
+    for trait_item in &mut item.items {
+        let attributes = match trait_item {
+            TraitItem::Const(item) => &mut item.attrs,
+            TraitItem::Fn(item) => &mut item.attrs,
+            TraitItem::Type(item) => &mut item.attrs,
+            TraitItem::Macro(item) => &mut item.attrs,
+            _ => continue,
+        };
+        attributes.retain(|attribute| !attribute.path().is_ident("slot"));
+    }
 }
 
 // ============================================================
 // Schema
 // ============================================================
 
-struct Schema {
-    visibility: String,
-    name: String,
-    methods: Vec<Method>,
+struct Schema<'a> {
+    visibility: &'a Visibility,
+    name: &'a Ident,
+    methods: Vec<Method<'a>>,
 }
 
-struct Method {
-    name: String,
+struct Method<'a> {
+    name: &'a Ident,
     slot: u32,
     /// The trait's declaration of this method, reused verbatim so that the
     /// generated implementations are guaranteed to match it.
-    signature: String,
-    kind: Kind,
+    signature: &'a Signature,
+    kind: Kind<'a>,
 }
 
-enum Kind {
+enum Kind<'a> {
     Str,
     Bytes,
     /// A fixed width primitive, named by its Rust type.
-    Scalar(String),
+    Scalar(&'a Ident),
     /// A nested message, named by the path of its schema trait.
-    Nested(String),
+    Nested(&'a Path),
     /// A sequence of nested messages.
-    Repeated(String),
+    Repeated(&'a Path),
 }
 
 /// Names a schema by its trait, spelling out the `'static` object lifetime that
 /// `impl Zerializable for dyn Trait` is written against. Without it the default
 /// object lifetime in a return type is the one elided from `&self`.
-fn schema_of(path: &str) -> String {
-    format!("(dyn {path} + 'static)")
-}
-
-fn last_segment(path: &str) -> &str {
-    path.rsplit("::").next().unwrap_or(path)
+fn schema_of(path: &Path) -> TokenStream {
+    quote!((dyn #path + 'static))
 }
 
 /// The view type of another schema, named through its `Zerializable` impl so
 /// that nested schemas do not have to live in the same module.
-fn view_of(path: &str) -> String {
-    format!(
-        "<{} as ::zerialize::Zerializable>::View<'buf>",
-        schema_of(path)
-    )
+fn view_of(path: &Path) -> TokenStream {
+    let schema = schema_of(path);
+    quote!(<#schema as ::zerialize::Zerializable>::View<'buf>)
 }
 
 const SCALARS: [&str; 11] = [
@@ -119,673 +140,538 @@ const SCALARS: [&str; 11] = [
 // Parsing
 // ============================================================
 
-fn parse_schema(tokens: &[TokenTree]) -> Result<Schema, Error> {
-    let mut index = 0;
-    while is_punct(tokens.get(index), '#') {
-        index += 2;
-    }
-
-    let mut visibility = String::new();
-    if is_ident(tokens.get(index), "pub") {
-        visibility.push_str("pub");
-        index += 1;
-        if let Some(TokenTree::Group(group)) = tokens.get(index)
-            && group.delimiter() == Delimiter::Parenthesis
-        {
-            visibility.push_str(&group.to_string());
-            index += 1;
-        }
-    }
-
-    if !is_ident(tokens.get(index), "trait") {
-        return Err(Error::new(
-            span_of(tokens.get(index)),
-            "#[zerializable] may only be applied to a trait",
+fn parse_schema(item: &ItemTrait) -> Result<Schema<'_>, Error> {
+    item.modifiers.require_empty()?;
+    if let Some(unsafety) = &item.unsafety {
+        return Err(Error::new_spanned(
+            unsafety,
+            "#[zerializable] traits may not be `unsafe`",
         ));
     }
-    index += 1;
+    if !item.generics.params.is_empty() {
+        return Err(Error::new_spanned(
+            &item.generics,
+            "#[zerializable] traits may not have generic parameters",
+        ));
+    }
+    if let Some(where_clause) = &item.generics.where_clause {
+        return Err(Error::new_spanned(
+            where_clause,
+            "#[zerializable] traits may not have a where clause",
+        ));
+    }
+    if !item.supertraits.is_empty() {
+        return Err(Error::new_spanned(
+            &item.supertraits,
+            "#[zerializable] traits may not have supertraits",
+        ));
+    }
 
-    let name = match tokens.get(index) {
-        Some(TokenTree::Ident(ident)) => ident.to_string(),
-        other => return Err(Error::new(span_of(other), "expected a trait name")),
-    };
-    index += 1;
-
-    let body = match tokens.get(index) {
-        Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Brace => group,
-        other => {
-            return Err(Error::new(
-                span_of(other),
-                "#[zerializable] traits may not have generic parameters, supertraits, \
-                 or a where clause",
+    let mut methods = Vec::new();
+    for trait_item in &item.items {
+        let TraitItem::Fn(function) = trait_item else {
+            return Err(Error::new_spanned(
+                trait_item,
+                "#[zerializable] traits may only contain methods",
             ));
-        }
-    };
+        };
+        methods.push(parse_method(function, &methods)?);
+    }
 
-    let methods = parse_methods(body)?;
     Ok(Schema {
-        visibility,
-        name,
+        visibility: &item.vis,
+        name: &item.ident,
         methods,
     })
 }
 
-fn parse_methods(body: &Group) -> Result<Vec<Method>, Error> {
-    let tokens: Vec<TokenTree> = body.stream().into_iter().collect();
-    let mut methods: Vec<Method> = Vec::new();
-    let mut index = 0;
-
-    while index < tokens.len() {
-        let mut slot: Option<(u32, Span)> = None;
-        while is_punct(tokens.get(index), '#') {
-            let attribute = match tokens.get(index + 1) {
-                Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Bracket => group,
-                other => return Err(Error::new(span_of(other), "expected an attribute")),
-            };
-            if let Some(value) = parse_slot(attribute)? {
-                slot = Some((value, attribute.span()));
-            }
-            index += 2;
+/// Parses one method, given the methods of the same trait already parsed, which
+/// is what a slot is checked for uniqueness against.
+fn parse_method<'a>(function: &'a TraitItemFn, parsed: &[Method<'a>]) -> Result<Method<'a>, Error> {
+    let mut declared = None;
+    for attribute in &function.attrs {
+        if attribute.path().is_ident("slot") {
+            declared = Some((parse_slot(attribute)?, attribute));
         }
-
-        let start = index;
-        if !is_ident(tokens.get(index), "fn") {
-            return Err(Error::new(
-                span_of(tokens.get(index)),
-                "#[zerializable] traits may only contain methods",
-            ));
-        }
-        index += 1;
-
-        let name = match tokens.get(index) {
-            Some(TokenTree::Ident(ident)) => ident.to_string(),
-            other => return Err(Error::new(span_of(other), "expected a method name")),
-        };
-        index += 1;
-
-        match tokens.get(index) {
-            Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Parenthesis => {
-                let arguments: Vec<TokenTree> = group.stream().into_iter().collect();
-                if !(arguments.len() == 2
-                    && is_punct(arguments.first(), '&')
-                    && is_ident(arguments.get(1), "self"))
-                {
-                    return Err(Error::new(
-                        group.span(),
-                        "#[zerializable] methods must take `&self` and no other arguments",
-                    ));
-                }
-            }
-            other => return Err(Error::new(span_of(other), "expected an argument list")),
-        }
-        index += 1;
-
-        if !(is_punct(tokens.get(index), '-') && is_punct(tokens.get(index + 1), '>')) {
-            return Err(Error::new(
-                span_of(tokens.get(index)),
-                "#[zerializable] methods must return a value",
-            ));
-        }
-        index += 2;
-
-        let return_start = index;
-        while index < tokens.len() && !is_signature_end(tokens.get(index)) {
-            index += 1;
-        }
-        let return_type = &tokens[return_start..index];
-        let return_span = span_of(tokens.get(return_start));
-
-        let where_start = index;
-        if is_ident(tokens.get(index), "where") {
-            index += 1;
-            while index < tokens.len() && !is_signature_end(tokens.get(index)) {
-                index += 1;
-            }
-        }
-        let where_clause = &tokens[where_start..index];
-
-        match tokens.get(index) {
-            Some(TokenTree::Punct(punct)) if punct.as_char() == ';' => index += 1,
-            other => {
-                return Err(Error::new(
-                    span_of(other),
-                    "#[zerializable] methods may not have a default body",
-                ));
-            }
-        }
-
-        let kind = parse_return_type(return_type, return_span)?;
-        if matches!(kind, Kind::Nested(_) | Kind::Repeated(_))
-            && !where_clause
-                .iter()
-                .any(|token| is_ident(Some(token), "Sized"))
-        {
-            return Err(Error::new(
-                return_span,
-                "methods returning `impl Trait` must be declared `where Self: Sized`, \
-                 so that `dyn Trait` stays dyn compatible",
-            ));
-        }
-
-        let Some((slot, slot_span)) = slot else {
-            return Err(Error::new(
-                span_of(tokens.get(start)),
-                "every #[zerializable] method requires a #[slot(N)] attribute",
-            ));
-        };
-        if let Some(previous) = methods.iter().find(|method| method.slot == slot) {
-            return Err(Error::new(
-                slot_span,
-                &format!("slot {slot} is already used by `{}`", previous.name),
-            ));
-        }
-
-        methods.push(Method {
-            signature: format!(
-                "fn {name}(&self) -> {} {}",
-                to_source(return_type),
-                to_source(where_clause)
-            ),
-            name,
-            slot,
-            kind,
-        });
     }
 
-    Ok(methods)
+    function.modifiers.require_empty()?;
+    if let Some(default) = &function.default {
+        return Err(Error::new_spanned(
+            default,
+            "#[zerializable] methods may not have a default body",
+        ));
+    }
+
+    let signature = &function.sig;
+    if !signature.generics.params.is_empty() {
+        return Err(Error::new_spanned(
+            &signature.generics,
+            "#[zerializable] methods may not have generic parameters",
+        ));
+    }
+    if signature.constness.is_some()
+        || signature.asyncness.is_some()
+        || signature.abi.is_some()
+        || !matches!(signature.safety, Safety::Default)
+    {
+        return Err(Error::new_spanned(
+            signature,
+            "#[zerializable] methods may not be `const`, `async`, `unsafe`, or `extern`",
+        ));
+    }
+    if !takes_shared_self(signature) {
+        return Err(Error::new(
+            signature.paren_token.span.join(),
+            "#[zerializable] methods must take `&self` and no other arguments",
+        ));
+    }
+
+    let ReturnType::Type(_, return_type) = &signature.output else {
+        return Err(Error::new_spanned(
+            signature,
+            "#[zerializable] methods must return a value",
+        ));
+    };
+    let kind = parse_return_type(return_type)?;
+    if matches!(kind, Kind::Nested(_) | Kind::Repeated(_)) && !requires_sized(signature) {
+        return Err(Error::new_spanned(
+            return_type,
+            "methods returning `impl Trait` must be declared `where Self: Sized`, \
+             so that `dyn Trait` stays dyn compatible",
+        ));
+    }
+
+    let Some((slot, attribute)) = declared else {
+        return Err(Error::new_spanned(
+            signature,
+            "every #[zerializable] method requires a #[slot(N)] attribute",
+        ));
+    };
+    if let Some(previous) = parsed.iter().find(|method| method.slot == slot) {
+        return Err(Error::new_spanned(
+            attribute,
+            format!("slot {slot} is already used by `{}`", previous.name),
+        ));
+    }
+
+    Ok(Method {
+        name: &signature.ident,
+        slot,
+        signature,
+        kind,
+    })
 }
 
-/// Returns the slot number of a `#[slot(N)]` attribute, or `None` for any other
-/// attribute, which is left on the method untouched.
-fn parse_slot(attribute: &Group) -> Result<Option<u32>, Error> {
-    let tokens: Vec<TokenTree> = attribute.stream().into_iter().collect();
-    if !is_ident(tokens.first(), "slot") {
-        return Ok(None);
-    }
-    let invalid = || Error::new(attribute.span(), "expected `#[slot(N)]`, where N is a u32");
-    if tokens.len() != 2 {
-        return Err(invalid());
-    }
-    match &tokens[1] {
-        TokenTree::Group(group) if group.delimiter() == Delimiter::Parenthesis => group
-            .stream()
-            .to_string()
-            .parse()
-            .map(Some)
-            .map_err(|_| invalid()),
-        _ => Err(invalid()),
+/// Returns the slot number a `#[slot(N)]` attribute declares.
+fn parse_slot(attribute: &Attribute) -> Result<u32, Error> {
+    let invalid = || Error::new_spanned(attribute, "expected `#[slot(N)]`, where N is a u32");
+    let slot: LitInt = attribute.parse_args().map_err(|_| invalid())?;
+    slot.base10_parse().map_err(|_| invalid())
+}
+
+fn takes_shared_self(signature: &Signature) -> bool {
+    signature.variadic.is_none()
+        && signature.inputs.len() == 1
+        && matches!(signature.inputs.first(), Some(FnArg::Receiver(receiver))
+            if matches!(receiver.kind, ReceiverKind::Reference(_, _, None)))
+}
+
+/// Whether a method is declared `where Self: Sized`, which is what keeps a
+/// trait dyn compatible despite returning `impl Trait`.
+fn requires_sized(signature: &Signature) -> bool {
+    let Some(where_clause) = &signature.generics.where_clause else {
+        return false;
+    };
+    where_clause.predicates.iter().any(|predicate| {
+        matches!(predicate, WherePredicate::Type(predicate)
+            if is_self(&predicate.bounded_ty)
+                && predicate.bounds.iter().any(|bound| matches!(bound, TypeParamBound::Trait(bound)
+                    if bound.maybe.is_none() && bound.path.is_ident("Sized"))))
+    })
+}
+
+fn is_self(ty: &Type) -> bool {
+    matches!(ty, Type::Path(path) if named(path).is_some_and(|name| name == "Self"))
+}
+
+/// The single identifier a type path names, if it is neither qualified nor
+/// generic.
+fn named(path: &TypePath) -> Option<&Ident> {
+    if path.qself.is_some() {
+        None
+    } else {
+        path.path.get_ident()
     }
 }
 
-fn parse_return_type(tokens: &[TokenTree], span: Span) -> Result<Kind, Error> {
+fn parse_return_type(ty: &Type) -> Result<Kind<'_>, Error> {
     let unsupported = || {
-        Error::new(
-            span,
+        Error::new_spanned(
+            ty,
             "unsupported return type: expected a scalar, `&str`, `&[u8]`, \
              `impl Trait + '_`, or `impl List<Item = impl Trait + '_> + '_`",
         )
     };
 
-    match tokens.first() {
-        Some(TokenTree::Punct(punct)) if punct.as_char() == '&' => {
-            let rest = skip_lifetime(&tokens[1..]);
-            if rest.len() != 1 {
-                return Err(unsupported());
-            }
-            match &rest[0] {
-                TokenTree::Ident(ident) if ident.to_string() == "str" => Ok(Kind::Str),
-                TokenTree::Group(group) if group.delimiter() == Delimiter::Bracket => {
-                    let inner: Vec<TokenTree> = group.stream().into_iter().collect();
-                    if inner.len() == 1 && is_ident(inner.first(), "u8") {
-                        Ok(Kind::Bytes)
-                    } else {
-                        Err(unsupported())
-                    }
-                }
+    match ty {
+        Type::Reference(reference) if reference.mutability.is_none() => match &*reference.elem {
+            Type::Path(path) if named(path).is_some_and(|name| name == "str") => Ok(Kind::Str),
+            Type::Slice(slice) => match &*slice.elem {
+                Type::Path(path) if named(path).is_some_and(|name| name == "u8") => Ok(Kind::Bytes),
                 _ => Err(unsupported()),
-            }
-        }
-        Some(TokenTree::Ident(ident)) if ident.to_string() == "impl" => {
-            let (path, rest) = parse_impl_trait(tokens, span)?;
-            if last_segment(&path) == "List" {
-                Ok(Kind::Repeated(parse_list_item(rest, span)?))
+            },
+            _ => Err(unsupported()),
+        },
+        Type::Path(path) => named(path)
+            .filter(|name| SCALARS.iter().any(|scalar| *name == scalar))
+            .map(Kind::Scalar)
+            .ok_or_else(unsupported),
+        Type::ImplTrait(impl_trait) => {
+            let bound = trait_bound(impl_trait)?;
+            let segment = bound
+                .path
+                .segments
+                .last()
+                .expect("a path has at least one segment");
+            if segment.ident == "List" {
+                Ok(Kind::Repeated(parse_list_item(segment)?))
             } else {
-                Ok(Kind::Nested(path))
+                Ok(Kind::Nested(&bound.path))
             }
-        }
-        Some(TokenTree::Ident(ident))
-            if tokens.len() == 1 && SCALARS.contains(&ident.to_string().as_str()) =>
-        {
-            Ok(Kind::Scalar(ident.to_string()))
         }
         _ => Err(unsupported()),
     }
 }
 
-/// Extracts the trait path out of `impl Path ...`, returning it along with
-/// whatever follows it. Any lifetime bound is left behind: the generated code
-/// does not need it, because a view borrows from the buffer, not the source.
-fn parse_impl_trait(tokens: &[TokenTree], span: Span) -> Result<(String, &[TokenTree]), Error> {
-    let mut path = String::new();
-    let mut index = 1;
-    while let Some(token) = tokens.get(index) {
-        match token {
-            TokenTree::Ident(ident) => path.push_str(&ident.to_string()),
-            TokenTree::Punct(punct) if punct.as_char() == ':' => path.push(':'),
-            _ => break,
-        }
-        index += 1;
+/// Extracts the trait an `impl Trait + '_` names. Its lifetime bound is left
+/// behind: the generated code does not need it, because a view borrows from the
+/// buffer, not the source.
+fn trait_bound(impl_trait: &TypeImplTrait) -> Result<&TraitBound, Error> {
+    match impl_trait.bounds.first() {
+        Some(TypeParamBound::Trait(bound)) => Ok(bound),
+        _ => Err(Error::new_spanned(
+            impl_trait,
+            "expected a trait path after `impl`",
+        )),
     }
-    if path.is_empty() {
-        return Err(Error::new(span, "expected a trait path after `impl`"));
-    }
-    Ok((path, &tokens[index..]))
 }
 
 /// Extracts the element schema out of the `<Item = impl Path + '_>` that
 /// follows `impl List`.
-fn parse_list_item(tokens: &[TokenTree], span: Span) -> Result<String, Error> {
+fn parse_list_item(list: &PathSegment) -> Result<&Path, Error> {
     let expected = || {
-        Error::new(
-            span,
+        Error::new_spanned(
+            list,
             "expected `impl List<Item = impl Trait + '_> + '_`, naming the schema \
              the list holds",
         )
     };
-    if !(is_punct(tokens.first(), '<')
-        && is_ident(tokens.get(1), "Item")
-        && is_punct(tokens.get(2), '='))
-    {
+    let PathArguments::AngleBracketed(arguments) = &list.arguments else {
         return Err(expected());
-    }
-    let item = tokens.get(3..).ok_or_else(expected)?;
-    if !is_ident(item.first(), "impl") {
+    };
+    let item = arguments
+        .args
+        .iter()
+        .find_map(|argument| match argument {
+            GenericArgument::AssocType(item) if item.ident == "Item" => Some(&item.ty),
+            _ => None,
+        })
+        .ok_or_else(expected)?;
+    let Type::ImplTrait(item) = item else {
         return Err(expected());
-    }
-    Ok(parse_impl_trait(item, span)?.0)
+    };
+    Ok(&trait_bound(item)?.path)
 }
 
 // ============================================================
 // Code generation
 // ============================================================
 
-fn generate(schema: &Schema) -> String {
+fn generate(schema: &Schema<'_>) -> TokenStream {
     const VALIDATED: &str = "the message was validated when it was decoded";
     let Schema {
         visibility,
         name,
         methods,
     } = schema;
-    let view = format!("{name}View");
-    let source = format!("__{name}Source");
+    let view = format_ident!("{}View", name);
+    let source = format_ident!("__{}Source", name);
     // The offset table is indexed by slot, so it is as long as the highest one.
-    let slots = methods
-        .iter()
-        .map(|method| method.slot as usize + 1)
-        .max()
-        .unwrap_or(0);
-    let mut out = String::new();
+    let slots = Literal::usize_suffixed(
+        methods
+            .iter()
+            .map(|method| method.slot as usize + 1)
+            .max()
+            .unwrap_or(0),
+    );
 
-    // The object safe adapter that gives `encode::<dyn Trait>(&value)` a single
-    // dynamic call to dispatch on, rather than one per field.
-    emit!(out, "#[doc(hidden)]");
-    emit!(out, "{visibility} trait {source} {{");
-    emit!(
-        out,
-        "    fn __zerialize_encode(&self, __writer: &mut ::zerialize::Writer);"
-    );
-    emit!(out, "}}");
-
-    emit!(out, "impl<__S: {name}> {source} for __S {{");
-    emit!(
-        out,
-        "    fn __zerialize_encode(&self, __writer: &mut ::zerialize::Writer) {{"
-    );
-    emit!(
-        out,
-        "        let __frame = __writer.begin_frame({slots}usize);"
-    );
-    for method in methods {
-        emit!(
-            out,
-            "        __writer.begin_entry(&__frame, {}usize);",
-            method.slot
-        );
-        let value = format!("<Self as {name}>::{}(self)", method.name);
-        match &method.kind {
-            Kind::Str => emit!(out, "        __writer.write_str({value});"),
-            Kind::Bytes => emit!(out, "        __writer.write_bytes({value});"),
-            Kind::Scalar(ty) => emit!(out, "        __writer.write_{ty}({value});"),
+    let encoded = methods.iter().map(|method| {
+        let entry = Literal::usize_suffixed(method.slot as usize);
+        let value = {
+            let method = method.name;
+            quote!(<Self as #name>::#method(self))
+        };
+        let write = match &method.kind {
+            Kind::Str => quote!(__writer.write_str(#value);),
+            Kind::Bytes => quote!(__writer.write_bytes(#value);),
+            Kind::Scalar(scalar) => {
+                let write = format_ident!("write_{}", scalar);
+                quote!(__writer.#write(#value);)
+            }
             Kind::Nested(path) => {
-                emit!(out, "        let __value = {value};");
-                emit!(
-                    out,
-                    "        <{} as ::zerialize::Zerializable>::encode_source(&__value, __writer);",
-                    schema_of(path)
-                );
+                let schema = schema_of(path);
+                quote! {
+                    let __value = #value;
+                    <#schema as ::zerialize::Zerializable>::encode_source(&__value, __writer);
+                }
             }
             Kind::Repeated(path) => {
-                emit!(out, "        let __items = {value};");
-                emit!(
-                    out,
-                    "        let __length = ::zerialize::List::len(&__items);"
-                );
-                emit!(out, "        let __list = __writer.begin_frame(__length);");
-                emit!(out, "        for __index in 0..__length {{");
-                emit!(
-                    out,
-                    "            let __item = ::zerialize::List::get(&__items, __index)\
-                     .expect(\"List::get returned None below List::len\");"
-                );
-                emit!(out, "            __writer.begin_entry(&__list, __index);");
-                emit!(
-                    out,
-                    "            <{} as ::zerialize::Zerializable>::encode_source(&__item, __writer);",
-                    schema_of(path)
-                );
-                emit!(out, "        }}");
-                emit!(out, "        __writer.end_frame(__list);");
+                let schema = schema_of(path);
+                quote! {
+                    let __items = #value;
+                    let __length = ::zerialize::List::len(&__items);
+                    let __list = __writer.begin_frame(__length);
+                    for __index in 0..__length {
+                        let __item = ::zerialize::List::get(&__items, __index)
+                            .expect("List::get returned None below List::len");
+                        __writer.begin_entry(&__list, __index);
+                        <#schema as ::zerialize::Zerializable>::encode_source(&__item, __writer);
+                    }
+                    __writer.end_frame(__list);
+                }
             }
+        };
+        quote! {
+            __writer.begin_entry(&__frame, #entry);
+            #write
         }
-    }
-    emit!(out, "        __writer.end_frame(__frame);");
-    emit!(out, "    }}");
-    emit!(out, "}}");
+    });
 
     // So that an implementation can return `&self.nested` as `impl Trait + '_`.
-    emit!(out, "impl<__S: {name}> {name} for &__S {{");
-    for method in methods {
-        emit!(out, "    {} {{", method.signature);
-        emit!(out, "        <__S as {name}>::{}(*self)", method.name);
-        emit!(out, "    }}");
-    }
-    emit!(out, "}}");
-
-    // The view is the bytes of the message and nothing else. Fields are read
-    // out of them on access, by indexing the frame's offset table with the
-    // slot number, so a view costs the same whatever its schema holds.
-    emit!(out, "/// Zero-copy view of a `{name}` message.");
-    emit!(out, "///");
-    emit!(
-        out,
-        "/// Returned by `decode::<dyn {name}>`, borrowing from the buffer that"
-    );
-    emit!(out, "/// was decoded rather than owning its contents.");
-    emit!(out, "#[derive(::core::clone::Clone, ::core::marker::Copy)]");
-    emit!(out, "#[allow(dead_code)]");
-    emit!(out, "{visibility} struct {view}<'buf> {{");
-    emit!(out, "    bytes: &'buf [u8],");
-    emit!(out, "}}");
+    let forwarded = methods.iter().map(|method| {
+        let signature = method.signature;
+        let method = method.name;
+        quote! {
+            #signature {
+                <__S as #name>::#method(*self)
+            }
+        }
+    });
 
     // Inherent accessors shadow the trait's, and return concrete view types
     // rather than the trait's opaque `impl Trait`, which lets callers keep
     // using nested views as views.
-    emit!(out, "#[allow(dead_code)]");
-    emit!(out, "impl<'buf> {view}<'buf> {{");
-    for method in methods {
-        let slot = method.slot;
+    let accessors = methods.iter().map(|method| {
+        let slot = Literal::u32_suffixed(method.slot);
         let (return_type, body) = match &method.kind {
             Kind::Str => (
-                "&'buf str".to_string(),
-                format!("__message.read_str({slot}u32).expect({VALIDATED:?})"),
+                quote!(&'buf str),
+                quote!(__message.read_str(#slot).expect(#VALIDATED)),
             ),
             Kind::Bytes => (
-                "&'buf [u8]".to_string(),
-                format!("__message.read_bytes({slot}u32).expect({VALIDATED:?})"),
+                quote!(&'buf [u8]),
+                quote!(__message.read_bytes(#slot).expect(#VALIDATED)),
             ),
-            Kind::Scalar(ty) => (
-                ty.clone(),
-                format!("__message.read_{ty}({slot}u32).expect({VALIDATED:?})"),
-            ),
-            Kind::Nested(path) => (
-                view_of(path),
-                format!(
-                    "<{schema} as ::zerialize::Zerializable>::decode_view(\
-                     __message.read_message({slot}u32).expect({VALIDATED:?})).expect({VALIDATED:?})",
-                    schema = schema_of(path)
-                ),
-            ),
-            Kind::Repeated(path) => (
-                format!("::zerialize::ListView<'buf, {}>", schema_of(path)),
-                format!("__message.read_list({slot}u32).expect({VALIDATED:?})"),
-            ),
+            Kind::Scalar(scalar) => {
+                let read = format_ident!("read_{}", scalar);
+                (
+                    quote!(#scalar),
+                    quote!(__message.#read(#slot).expect(#VALIDATED)),
+                )
+            }
+            Kind::Nested(path) => {
+                let schema = schema_of(path);
+                (
+                    view_of(path),
+                    quote! {
+                        <#schema as ::zerialize::Zerializable>::decode_view(
+                            __message.read_message(#slot).expect(#VALIDATED),
+                        )
+                        .expect(#VALIDATED)
+                    },
+                )
+            }
+            Kind::Repeated(path) => {
+                let schema = schema_of(path);
+                (
+                    quote!(::zerialize::ListView<'buf, #schema>),
+                    quote!(__message.read_list(#slot).expect(#VALIDATED)),
+                )
+            }
         };
-        emit!(
-            out,
-            "    {visibility} fn {}(&self) -> {return_type} {{",
-            method.name
-        );
-        emit!(
-            out,
-            "        let __message = ::zerialize::Message::trusted(self.bytes);"
-        );
-        emit!(out, "        {body}");
-        emit!(out, "    }}");
-    }
-    emit!(out, "}}");
+        let method = method.name;
+        quote! {
+            #visibility fn #method(&self) -> #return_type {
+                let __message = ::zerialize::Message::trusted(self.bytes);
+                #body
+            }
+        }
+    });
 
-    emit!(out, "impl<'buf> {name} for {view}<'buf> {{");
-    for method in methods {
-        emit!(out, "    {} {{", method.signature);
-        emit!(out, "        {view}::{}(self)", method.name);
-        emit!(out, "    }}");
-    }
-    emit!(out, "}}");
+    let implemented = methods.iter().map(|method| {
+        let signature = method.signature;
+        let method = method.name;
+        quote! {
+            #signature {
+                #view::#method(self)
+            }
+        }
+    });
 
     // A view compares equal to any implementation holding the same data, which
     // is what makes round trips assertable.
-    emit!(
-        out,
-        "impl<__S: {name}> ::core::cmp::PartialEq<__S> for {view}<'_> {{"
-    );
-    emit!(out, "    fn eq(&self, __other: &__S) -> bool {{");
-    for method in methods {
-        let mine = format!("{view}::{}(self)", method.name);
-        let theirs = format!("<__S as {name}>::{}(__other)", method.name);
+    let comparisons = methods.iter().map(|method| {
+        let field = method.name;
+        let mine = quote!(#view::#field(self));
+        let theirs = quote!(<__S as #name>::#field(__other));
         match &method.kind {
-            Kind::Repeated(_) => {
-                emit!(out, "        let __mine = {mine};");
-                emit!(out, "        let __theirs = {theirs};");
-                emit!(
-                    out,
-                    "        if ::zerialize::List::len(&__mine) \
-                     != ::zerialize::List::len(&__theirs) {{"
-                );
-                emit!(out, "            return false;");
-                emit!(out, "        }}");
-                emit!(
-                    out,
-                    "        for (__left, __right) in ::zerialize::List::iter(&__mine)\
-                     .zip(::zerialize::List::iter(&__theirs)) {{"
-                );
-                emit!(out, "            if __left != __right {{");
-                emit!(out, "                return false;");
-                emit!(out, "            }}");
-                emit!(out, "        }}");
-            }
-            _ => {
-                emit!(out, "        if {mine} != {theirs} {{");
-                emit!(out, "            return false;");
-                emit!(out, "        }}");
-            }
+            Kind::Repeated(_) => quote! {
+                let __mine = #mine;
+                let __theirs = #theirs;
+                if ::zerialize::List::len(&__mine) != ::zerialize::List::len(&__theirs) {
+                    return false;
+                }
+                for (__left, __right) in
+                    ::zerialize::List::iter(&__mine).zip(::zerialize::List::iter(&__theirs))
+                {
+                    if __left != __right {
+                        return false;
+                    }
+                }
+            },
+            _ => quote! {
+                if #mine != #theirs {
+                    return false;
+                }
+            },
         }
-    }
-    emit!(out, "        true");
-    emit!(out, "    }}");
-    emit!(out, "}}");
+    });
 
     // Debug reads the fields rather than the bytes, so a view prints as the
     // message it stands for.
-    emit!(out, "impl ::core::fmt::Debug for {view}<'_> {{");
-    emit!(
-        out,
-        "    fn fmt(&self, __formatter: &mut ::core::fmt::Formatter<'_>) \
-         -> ::core::fmt::Result {{"
-    );
-    emit!(out, "        __formatter.debug_struct({view:?})");
-    for method in methods {
-        emit!(
-            out,
-            "            .field({:?}, &{view}::{}(self))",
-            method.name,
-            method.name
-        );
-    }
-    emit!(out, "            .finish()");
-    emit!(out, "    }}");
-    emit!(out, "}}");
+    let fields = methods.iter().map(|method| {
+        let method = method.name;
+        let label = method.to_string();
+        quote!(.field(#label, &#view::#method(self)))
+    });
 
-    emit!(out, "impl ::zerialize::Zerializable for dyn {name} {{");
-    emit!(out, "    type Source<'src> = dyn {source} + 'src;");
-    emit!(out, "    type View<'buf> = {view}<'buf>;");
-    emit!(
-        out,
-        "    fn encode_source<'src>(\
-         __source: &'src Self::Source<'src>, __writer: &mut ::zerialize::Writer) {{"
-    );
-    emit!(
-        out,
-        "        {source}::__zerialize_encode(__source, __writer)"
-    );
-    emit!(out, "    }}");
-    emit!(
-        out,
-        "    fn decode_view<'buf>(__message: ::zerialize::Message<'buf>) \
-         -> ::core::result::Result<Self::View<'buf>, ::zerialize::Error> {{"
-    );
-    if !methods.is_empty() {
-        // Reading every field is what validation is: it leaves the accessors
-        // above nothing that can fail.
-        emit!(out, "        if __message.validates() {{");
-        for method in methods {
-            let slot = method.slot;
-            match &method.kind {
-                Kind::Str => emit!(out, "            __message.read_str({slot}u32)?;"),
-                Kind::Bytes => emit!(out, "            __message.read_bytes({slot}u32)?;"),
-                Kind::Scalar(ty) => emit!(out, "            __message.read_{ty}({slot}u32)?;"),
-                Kind::Nested(path) => emit!(
-                    out,
-                    "            <{} as ::zerialize::Zerializable>::decode_view(\
-                     __message.read_message({slot}u32)?)?;",
-                    schema_of(path)
-                ),
-                Kind::Repeated(path) => emit!(
-                    out,
-                    "            __message.read_list::<{}>({slot}u32)?;",
-                    schema_of(path)
-                ),
+    // Reading every field is what validation is: it leaves the accessors above
+    // nothing that can fail.
+    let checks = methods.iter().map(|method| {
+        let slot = Literal::u32_suffixed(method.slot);
+        match &method.kind {
+            Kind::Str => quote!(__message.read_str(#slot)?;),
+            Kind::Bytes => quote!(__message.read_bytes(#slot)?;),
+            Kind::Scalar(scalar) => {
+                let read = format_ident!("read_{}", scalar);
+                quote!(__message.#read(#slot)?;)
             }
-        }
-        emit!(out, "        }}");
-    }
-    emit!(
-        out,
-        "        ::core::result::Result::Ok({view} {{ bytes: __message.bytes() }})"
-    );
-    emit!(out, "    }}");
-    emit!(out, "}}");
-
-    out
-}
-
-// ============================================================
-// Token helpers
-// ============================================================
-
-fn is_ident(token: Option<&TokenTree>, expected: &str) -> bool {
-    matches!(token, Some(TokenTree::Ident(ident)) if ident.to_string() == expected)
-}
-
-fn is_punct(token: Option<&TokenTree>, expected: char) -> bool {
-    matches!(token, Some(TokenTree::Punct(punct)) if punct.as_char() == expected)
-}
-
-/// Whether a token ends the part of a method declaration the macro reads.
-fn is_signature_end(token: Option<&TokenTree>) -> bool {
-    is_punct(token, ';')
-        || is_ident(token, "where")
-        || matches!(token, Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Brace)
-}
-
-fn skip_lifetime(tokens: &[TokenTree]) -> &[TokenTree] {
-    if is_punct(tokens.first(), '\'') {
-        &tokens[2..]
-    } else {
-        tokens
-    }
-}
-
-fn span_of(token: Option<&TokenTree>) -> Span {
-    token.map_or_else(Span::call_site, TokenTree::span)
-}
-
-fn to_source(tokens: &[TokenTree]) -> String {
-    tokens.iter().cloned().collect::<TokenStream>().to_string()
-}
-
-fn strip_slot_attributes(tokens: TokenStream) -> TokenStream {
-    let tokens: Vec<TokenTree> = tokens.into_iter().collect();
-    let mut output: Vec<TokenTree> = Vec::new();
-    let mut index = 0;
-    while index < tokens.len() {
-        if is_punct(tokens.get(index), '#')
-            && let Some(TokenTree::Group(group)) = tokens.get(index + 1)
-            && group.delimiter() == Delimiter::Bracket
-            && is_ident(group.stream().into_iter().next().as_ref(), "slot")
-        {
-            index += 2;
-            continue;
-        }
-        output.push(match &tokens[index] {
-            TokenTree::Group(group) => {
-                let mut stripped =
-                    Group::new(group.delimiter(), strip_slot_attributes(group.stream()));
-                stripped.set_span(group.span());
-                TokenTree::Group(stripped)
-            }
-            other => other.clone(),
-        });
-        index += 1;
-    }
-    output.into_iter().collect()
-}
-
-// ============================================================
-// Errors
-// ============================================================
-
-struct Error {
-    span: Span,
-    message: String,
-}
-
-impl Error {
-    fn new(span: Span, message: &str) -> Self {
-        Self {
-            span,
-            message: message.to_string(),
-        }
-    }
-
-    fn into_tokens(self) -> TokenStream {
-        let source = format!("::core::compile_error!({:?});", self.message);
-        let tokens: TokenStream = source.parse().expect("generated code is valid Rust");
-        respan(tokens, self.span)
-    }
-}
-
-fn respan(tokens: TokenStream, span: Span) -> TokenStream {
-    tokens
-        .into_iter()
-        .map(|token| {
-            let mut token = match token {
-                TokenTree::Group(group) => {
-                    TokenTree::Group(Group::new(group.delimiter(), respan(group.stream(), span)))
+            Kind::Nested(path) => {
+                let schema = schema_of(path);
+                quote! {
+                    <#schema as ::zerialize::Zerializable>::decode_view(
+                        __message.read_message(#slot)?,
+                    )?;
                 }
-                other => other,
-            };
-            token.set_span(span);
-            token
-        })
-        .collect()
+            }
+            Kind::Repeated(path) => {
+                let schema = schema_of(path);
+                quote!(__message.read_list::<#schema>(#slot)?;)
+            }
+        }
+    });
+    let validate = if methods.is_empty() {
+        TokenStream::new()
+    } else {
+        quote! {
+            if __message.validates() {
+                #(#checks)*
+            }
+        }
+    };
+
+    let documentation = format!(
+        "Zero-copy view of a `{name}` message.\n\n\
+         Returned by `decode::<dyn {name}>`, borrowing from the buffer that\n\
+         was decoded rather than owning its contents."
+    );
+    let view_name = view.to_string();
+
+    quote! {
+        // The object safe adapter that gives `encode::<dyn Trait>(&value)` a
+        // single dynamic call to dispatch on, rather than one per field.
+        #[doc(hidden)]
+        #visibility trait #source {
+            fn __zerialize_encode(&self, __writer: &mut ::zerialize::Writer);
+        }
+
+        impl<__S: #name> #source for __S {
+            fn __zerialize_encode(&self, __writer: &mut ::zerialize::Writer) {
+                let __frame = __writer.begin_frame(#slots);
+                #(#encoded)*
+                __writer.end_frame(__frame);
+            }
+        }
+
+        impl<__S: #name> #name for &__S {
+            #(#forwarded)*
+        }
+
+        // The view is the bytes of the message and nothing else. Fields are
+        // read out of them on access, by indexing the frame's offset table with
+        // the slot number, so a view costs the same whatever its schema holds.
+        #[doc = #documentation]
+        #[derive(::core::clone::Clone, ::core::marker::Copy)]
+        #[allow(dead_code)]
+        #visibility struct #view<'buf> {
+            bytes: &'buf [u8],
+        }
+
+        #[allow(dead_code)]
+        impl<'buf> #view<'buf> {
+            #(#accessors)*
+        }
+
+        impl<'buf> #name for #view<'buf> {
+            #(#implemented)*
+        }
+
+        impl<__S: #name> ::core::cmp::PartialEq<__S> for #view<'_> {
+            fn eq(&self, __other: &__S) -> bool {
+                #(#comparisons)*
+                true
+            }
+        }
+
+        impl ::core::fmt::Debug for #view<'_> {
+            fn fmt(
+                &self,
+                __formatter: &mut ::core::fmt::Formatter<'_>,
+            ) -> ::core::fmt::Result {
+                __formatter.debug_struct(#view_name)
+                    #(#fields)*
+                    .finish()
+            }
+        }
+
+        impl ::zerialize::Zerializable for dyn #name {
+            type Source<'src> = dyn #source + 'src;
+            type View<'buf> = #view<'buf>;
+
+            fn encode_source<'src>(
+                __source: &'src Self::Source<'src>,
+                __writer: &mut ::zerialize::Writer,
+            ) {
+                #source::__zerialize_encode(__source, __writer)
+            }
+
+            fn decode_view<'buf>(
+                __message: ::zerialize::Message<'buf>,
+            ) -> ::core::result::Result<Self::View<'buf>, ::zerialize::Error> {
+                #validate
+                ::core::result::Result::Ok(#view { bytes: __message.bytes() })
+            }
+        }
+    }
 }
