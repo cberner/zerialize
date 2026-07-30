@@ -8,9 +8,10 @@
 use proc_macro2::{Literal, TokenStream};
 use quote::{ToTokens, format_ident, quote};
 use syn::{
-    Attribute, Error, FnArg, GenericArgument, Ident, Item, ItemTrait, LitInt, Path, PathArguments,
-    PathSegment, ReceiverKind, ReturnType, Safety, Signature, TraitBound, TraitItem, TraitItemFn,
-    Type, TypeImplTrait, TypeParamBound, TypePath, Visibility, WherePredicate,
+    Attribute, Data, DataEnum, DataStruct, DeriveInput, Error, Fields, FnArg, GenericArgument,
+    Generics, Ident, Item, ItemTrait, LitInt, Path, PathArguments, PathSegment, ReceiverKind,
+    ReturnType, Safety, Signature, TraitBound, TraitItem, TraitItemFn, Type, TypeImplTrait,
+    TypeParamBound, TypePath, Visibility, WherePredicate,
 };
 
 /// Turns a trait into a zero-copy serialization schema.
@@ -28,11 +29,12 @@ use syn::{
 /// * `impl Zerializable for dyn Trait`, which is how `dyn Trait` comes to name
 ///   the schema in `encode::<dyn Trait>()` and `decode::<dyn Trait>()`.
 ///
-/// Methods may return a scalar, `&str`, `&[u8]`, a nested schema as
-/// `impl Trait + '_`, or a sequence of them as
+/// Methods may return a scalar, `&str`, `&[u8]`, a value type named outright,
+/// a nested schema as `impl Trait + '_`, or a sequence of them as
 /// `impl List<Item = impl Trait + '_> + '_`. The last two return `impl Trait`,
 /// so they must be declared `where Self: Sized` to keep `dyn Trait` usable as
-/// the schema's name.
+/// the schema's name. A value type, being `Copy`, is instead returned as
+/// itself: see [`macro@Zerializable`].
 #[proc_macro_attribute]
 pub fn zerializable(
     args: proc_macro::TokenStream,
@@ -88,6 +90,33 @@ fn strip_slot_attributes(item: &mut ItemTrait) {
     }
 }
 
+/// Turns a `Copy` struct or enum into a value: a type a schema holds by value,
+/// and which decoding hands back as itself rather than as a view.
+///
+/// A value struct declares the slot each of its fields occupies with
+/// `#[slot(N)]`, exactly as a schema's methods do, and a value enum declares
+/// the number each of its variants is written as with `#[variant(N)]`. Both are
+/// the identity of what they name on the wire, so renaming and reordering are
+/// safe, and a struct may gain fields without breaking readers built against
+/// the older one. An enum may not: a reader rejects a variant it does not know.
+///
+/// Fields may be scalars or other values, which is what keeps a value `Copy`:
+/// nothing it holds can borrow from the buffer it was read from. The type must
+/// also be `Debug` and `PartialEq`, because the views that carry it print and
+/// compare it.
+#[proc_macro_derive(Zerializable, attributes(slot, variant))]
+pub fn derive_zerializable(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let item = match syn::parse::<DeriveInput>(item) {
+        Ok(item) => item,
+        Err(error) => return error.to_compile_error().into(),
+    };
+    match parse_value(&item) {
+        Ok(value) => generate_value(&value),
+        Err(error) => error.to_compile_error(),
+    }
+    .into()
+}
+
 // ============================================================
 // Schema
 // ============================================================
@@ -112,6 +141,8 @@ enum Kind<'a> {
     Bytes,
     /// A fixed width primitive, named by its Rust type.
     Scalar(&'a Ident),
+    /// A `Copy` type held by value, named by its path.
+    Value(&'a Path),
     /// A nested message, named by the path of its schema trait.
     Nested(&'a Path),
     /// A sequence of nested messages.
@@ -148,18 +179,7 @@ fn parse_schema(item: &ItemTrait) -> Result<Schema<'_>, Error> {
             "#[zerializable] traits may not be `unsafe`",
         ));
     }
-    if !item.generics.params.is_empty() {
-        return Err(Error::new_spanned(
-            &item.generics,
-            "#[zerializable] traits may not have generic parameters",
-        ));
-    }
-    if let Some(where_clause) = &item.generics.where_clause {
-        return Err(Error::new_spanned(
-            where_clause,
-            "#[zerializable] traits may not have a where clause",
-        ));
-    }
+    require_no_generics(&item.generics, "#[zerializable] traits")?;
     if !item.supertraits.is_empty() {
         return Err(Error::new_spanned(
             &item.supertraits,
@@ -185,15 +205,28 @@ fn parse_schema(item: &ItemTrait) -> Result<Schema<'_>, Error> {
     })
 }
 
+/// Rejects the generics neither macro can generate code for: nothing either one
+/// produces is parameterized.
+fn require_no_generics(generics: &Generics, what: &str) -> Result<(), Error> {
+    if !generics.params.is_empty() {
+        return Err(Error::new_spanned(
+            generics,
+            format!("{what} may not have generic parameters"),
+        ));
+    }
+    if let Some(where_clause) = &generics.where_clause {
+        return Err(Error::new_spanned(
+            where_clause,
+            format!("{what} may not have a where clause"),
+        ));
+    }
+    Ok(())
+}
+
 /// Parses one method, given the methods of the same trait already parsed, which
 /// is what a slot is checked for uniqueness against.
 fn parse_method<'a>(function: &'a TraitItemFn, parsed: &[Method<'a>]) -> Result<Method<'a>, Error> {
-    let mut declared = None;
-    for attribute in &function.attrs {
-        if attribute.path().is_ident("slot") {
-            declared = Some((parse_slot(attribute)?, attribute));
-        }
-    }
+    let declared = declared_number(&function.attrs, "slot")?;
 
     function.modifiers.require_empty()?;
     if let Some(default) = &function.default {
@@ -263,11 +296,30 @@ fn parse_method<'a>(function: &'a TraitItemFn, parsed: &[Method<'a>]) -> Result<
     })
 }
 
-/// Returns the slot number a `#[slot(N)]` attribute declares.
-fn parse_slot(attribute: &Attribute) -> Result<u32, Error> {
-    let invalid = || Error::new_spanned(attribute, "expected `#[slot(N)]`, where N is a u32");
-    let slot: LitInt = attribute.parse_args().map_err(|_| invalid())?;
-    slot.base10_parse().map_err(|_| invalid())
+/// The number the last `#[name(N)]` attribute declares, with the attribute it
+/// came from, which is what a duplicate is reported against.
+fn declared_number<'a>(
+    attributes: &'a [Attribute],
+    name: &str,
+) -> Result<Option<(u32, &'a Attribute)>, Error> {
+    let mut declared = None;
+    for attribute in attributes {
+        if attribute.path().is_ident(name) {
+            declared = Some((parse_number(attribute, name)?, attribute));
+        }
+    }
+    Ok(declared)
+}
+
+fn parse_number(attribute: &Attribute, name: &str) -> Result<u32, Error> {
+    let invalid = || {
+        Error::new_spanned(
+            attribute,
+            format!("expected `#[{name}(N)]`, where N is a u32"),
+        )
+    };
+    let number: LitInt = attribute.parse_args().map_err(|_| invalid())?;
+    number.base10_parse().map_err(|_| invalid())
 }
 
 fn takes_shared_self(signature: &Signature) -> bool {
@@ -305,11 +357,16 @@ fn named(path: &TypePath) -> Option<&Ident> {
     }
 }
 
+/// The scalar a type path names, if it names one.
+fn scalar(path: &TypePath) -> Option<&Ident> {
+    named(path).filter(|name| SCALARS.iter().any(|scalar| *name == scalar))
+}
+
 fn parse_return_type(ty: &Type) -> Result<Kind<'_>, Error> {
     let unsupported = || {
         Error::new_spanned(
             ty,
-            "unsupported return type: expected a scalar, `&str`, `&[u8]`, \
+            "unsupported return type: expected a scalar, a value type, `&str`, `&[u8]`, \
              `impl Trait + '_`, or `impl List<Item = impl Trait + '_> + '_`",
         )
     };
@@ -323,10 +380,12 @@ fn parse_return_type(ty: &Type) -> Result<Kind<'_>, Error> {
             },
             _ => Err(unsupported()),
         },
-        Type::Path(path) => named(path)
-            .filter(|name| SCALARS.iter().any(|scalar| *name == scalar))
-            .map(Kind::Scalar)
-            .ok_or_else(unsupported),
+        // Anything else named outright is a value: a `#[derive(Zerializable)]`
+        // type, which is returned as itself rather than as a view of the buffer.
+        Type::Path(path) if path.qself.is_none() => Ok(match scalar(path) {
+            Some(scalar) => Kind::Scalar(scalar),
+            None => Kind::Value(&path.path),
+        }),
         Type::ImplTrait(impl_trait) => {
             let bound = trait_bound(impl_trait)?;
             let segment = bound
@@ -419,6 +478,9 @@ fn generate(schema: &Schema<'_>) -> TokenStream {
                 let write = format_ident!("write_{}", scalar);
                 quote!(__writer.#write(#value);)
             }
+            Kind::Value(path) => quote! {
+                <#path as ::zerialize::Value>::encode_value(&#value, __writer);
+            },
             Kind::Nested(path) => {
                 let schema = schema_of(path);
                 quote! {
@@ -480,6 +542,13 @@ fn generate(schema: &Schema<'_>) -> TokenStream {
                     quote!(__message.#read(#slot).expect(#VALIDATED)),
                 )
             }
+            Kind::Value(path) => (
+                quote!(#path),
+                quote! {
+                    <#path as ::zerialize::Value>::decode_value(__message, #slot)
+                        .expect(#VALIDATED)
+                },
+            ),
             Kind::Nested(path) => {
                 let schema = schema_of(path);
                 (
@@ -566,6 +635,9 @@ fn generate(schema: &Schema<'_>) -> TokenStream {
             Kind::Scalar(scalar) => {
                 let read = format_ident!("read_{}", scalar);
                 quote!(__message.#read(#slot)?;)
+            }
+            Kind::Value(path) => {
+                quote!(<#path as ::zerialize::Value>::decode_value(__message, #slot)?;)
             }
             Kind::Nested(path) => {
                 let schema = schema_of(path);
@@ -674,4 +746,250 @@ fn generate(schema: &Schema<'_>) -> TokenStream {
             }
         }
     }
+}
+
+// ============================================================
+// Values
+// ============================================================
+
+/// A `Copy` type a schema holds by value.
+struct Value<'a> {
+    name: &'a Ident,
+    shape: Shape<'a>,
+}
+
+/// How a value is written where the message that holds it has left room for it.
+enum Shape<'a> {
+    /// As a frame of fields indexed by slot, exactly like a message.
+    Struct(Vec<Field<'a>>),
+    /// As the number of the variant, which is all a unit variant carries.
+    Enum(Vec<Variant<'a>>),
+}
+
+struct Field<'a> {
+    name: &'a Ident,
+    slot: u32,
+    /// A value's fields are what a `Copy` type may hold: nothing that borrows.
+    kind: FieldKind<'a>,
+}
+
+enum FieldKind<'a> {
+    Scalar(&'a Ident),
+    Value(&'a Path),
+}
+
+struct Variant<'a> {
+    name: &'a Ident,
+    number: u32,
+}
+
+fn parse_value(item: &DeriveInput) -> Result<Value<'_>, Error> {
+    require_no_generics(&item.generics, "#[derive(Zerializable)] types")?;
+    let shape = match &item.data {
+        Data::Struct(data) => Shape::Struct(parse_fields(data)?),
+        Data::Enum(data) => Shape::Enum(parse_variants(data)?),
+        Data::Union(data) => {
+            return Err(Error::new_spanned(
+                data.union_token,
+                "#[derive(Zerializable)] may only be applied to a struct or an enum",
+            ));
+        }
+    };
+    Ok(Value {
+        name: &item.ident,
+        shape,
+    })
+}
+
+fn parse_fields(data: &DataStruct) -> Result<Vec<Field<'_>>, Error> {
+    const NAMED: &str = "#[derive(Zerializable)] structs must have named fields, \
+                         each declaring the slot it occupies";
+    let fields = match &data.fields {
+        Fields::Named(fields) => &fields.named,
+        Fields::Unnamed(fields) => return Err(Error::new_spanned(fields, NAMED)),
+        Fields::Unit => return Err(Error::new_spanned(data.struct_token, NAMED)),
+    };
+
+    let mut parsed: Vec<Field<'_>> = Vec::new();
+    for field in fields {
+        let Some((slot, attribute)) = declared_number(&field.attrs, "slot")? else {
+            return Err(Error::new_spanned(
+                field,
+                "every field of a #[derive(Zerializable)] struct requires a #[slot(N)] attribute",
+            ));
+        };
+        if let Some(previous) = parsed.iter().find(|other| other.slot == slot) {
+            return Err(Error::new_spanned(
+                attribute,
+                format!("slot {slot} is already used by `{}`", previous.name),
+            ));
+        }
+        parsed.push(Field {
+            name: field
+                .ident
+                .as_ref()
+                .expect("named fields have an identifier"),
+            slot,
+            kind: parse_field_type(&field.ty)?,
+        });
+    }
+    Ok(parsed)
+}
+
+fn parse_field_type(ty: &Type) -> Result<FieldKind<'_>, Error> {
+    match ty {
+        Type::Path(path) if path.qself.is_none() => Ok(match scalar(path) {
+            Some(scalar) => FieldKind::Scalar(scalar),
+            None => FieldKind::Value(&path.path),
+        }),
+        _ => Err(Error::new_spanned(
+            ty,
+            "unsupported field type: expected a scalar or another value type. A value is \
+             `Copy`, so it may not hold anything borrowed or owned",
+        )),
+    }
+}
+
+fn parse_variants(data: &DataEnum) -> Result<Vec<Variant<'_>>, Error> {
+    if data.variants.is_empty() {
+        return Err(Error::new_spanned(
+            data.enum_token,
+            "#[derive(Zerializable)] enums must have at least one variant",
+        ));
+    }
+
+    let mut parsed: Vec<Variant<'_>> = Vec::new();
+    for variant in &data.variants {
+        if !matches!(variant.fields, Fields::Unit) {
+            return Err(Error::new_spanned(
+                &variant.fields,
+                "#[derive(Zerializable)] enum variants may not hold data",
+            ));
+        }
+        let Some((number, attribute)) = declared_number(&variant.attrs, "variant")? else {
+            return Err(Error::new_spanned(
+                variant,
+                "every variant of a #[derive(Zerializable)] enum requires a \
+                 #[variant(N)] attribute",
+            ));
+        };
+        if let Some(previous) = parsed.iter().find(|other| other.number == number) {
+            return Err(Error::new_spanned(
+                attribute,
+                format!("variant {number} is already used by `{}`", previous.name),
+            ));
+        }
+        parsed.push(Variant {
+            name: &variant.ident,
+            number,
+        });
+    }
+    Ok(parsed)
+}
+
+fn generate_value(value: &Value<'_>) -> TokenStream {
+    let Value { name, shape } = value;
+    let (encode, decode) = match shape {
+        Shape::Struct(fields) => generate_struct(fields),
+        Shape::Enum(variants) => generate_enum(variants),
+    };
+    quote! {
+        impl ::zerialize::Value for #name {
+            fn encode_value(&self, __writer: &mut ::zerialize::Writer) {
+                #encode
+            }
+
+            fn decode_value(
+                __message: ::zerialize::Message<'_>,
+                __slot: ::core::primitive::u32,
+            ) -> ::core::result::Result<Self, ::zerialize::Error> {
+                #decode
+            }
+        }
+    }
+}
+
+/// A value struct is a frame, so it is read and written exactly as a message
+/// is, and gains and loses fields with the same consequences.
+fn generate_struct(fields: &[Field<'_>]) -> (TokenStream, TokenStream) {
+    let slots = Literal::usize_suffixed(
+        fields
+            .iter()
+            .map(|field| field.slot as usize + 1)
+            .max()
+            .unwrap_or(0),
+    );
+
+    let written = fields.iter().map(|field| {
+        let entry = Literal::usize_suffixed(field.slot as usize);
+        let name = field.name;
+        let write = match &field.kind {
+            FieldKind::Scalar(scalar) => {
+                let write = format_ident!("write_{}", scalar);
+                quote!(__writer.#write(self.#name);)
+            }
+            FieldKind::Value(path) => quote! {
+                <#path as ::zerialize::Value>::encode_value(&self.#name, __writer);
+            },
+        };
+        quote! {
+            __writer.begin_entry(&__frame, #entry);
+            #write
+        }
+    });
+
+    let read = fields.iter().map(|field| {
+        let slot = Literal::u32_suffixed(field.slot);
+        let name = field.name;
+        let read = match &field.kind {
+            FieldKind::Scalar(scalar) => {
+                let read = format_ident!("read_{}", scalar);
+                quote!(__fields.#read(#slot)?)
+            }
+            FieldKind::Value(path) => {
+                quote!(<#path as ::zerialize::Value>::decode_value(__fields, #slot)?)
+            }
+        };
+        quote!(#name: #read,)
+    });
+
+    (
+        quote! {
+            let __frame = __writer.begin_frame(#slots);
+            #(#written)*
+            __writer.end_frame(__frame);
+        },
+        quote! {
+            let __fields = __message.read_message(__slot)?;
+            ::core::result::Result::Ok(Self { #(#read)* })
+        },
+    )
+}
+
+/// A value enum is its variant number and nothing else, so it costs a `u32`
+/// wherever it is held.
+fn generate_enum(variants: &[Variant<'_>]) -> (TokenStream, TokenStream) {
+    let written = variants.iter().map(|variant| {
+        let name = variant.name;
+        let number = Literal::u32_suffixed(variant.number);
+        quote!(Self::#name => #number,)
+    });
+
+    let read = variants.iter().map(|variant| {
+        let name = variant.name;
+        let number = Literal::u32_suffixed(variant.number);
+        quote!(#number => ::core::result::Result::Ok(Self::#name),)
+    });
+
+    (
+        quote! {
+            __writer.write_u32(match self { #(#written)* });
+        },
+        quote! {
+            match __message.read_u32(__slot)? {
+                #(#read)*
+                _ => ::core::result::Result::Err(::zerialize::Error::UnknownVariant),
+            }
+        },
+    )
 }
