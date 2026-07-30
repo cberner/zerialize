@@ -39,15 +39,61 @@
 //! input buffer instead of owning its contents. Because the view implements the
 //! schema trait too, decoded data can be passed anywhere the trait is accepted,
 //! including back into [`encode`].
+//!
+//! # Values
+//!
+//! A `Copy` struct or enum annotated with [`macro@Zerializable`] is a *value*:
+//! a field type that decodes back to itself rather than to a view, because
+//! there is nothing in it that could borrow from the buffer.
+//!
+//! ```
+//! use zerialize::{Zerializable, decode, encode, zerializable};
+//!
+//! #[derive(Zerializable, Copy, Clone, Debug, PartialEq)]
+//! enum Unit {
+//!     #[variant(0)]
+//!     Celsius,
+//!     #[variant(1)]
+//!     Fahrenheit,
+//! }
+//!
+//! #[derive(Zerializable, Copy, Clone, Debug, PartialEq)]
+//! struct Temperature {
+//!     #[slot(0)]
+//!     degrees: f32,
+//!     #[slot(1)]
+//!     unit: Unit,
+//! }
+//!
+//! #[zerializable]
+//! trait Reading {
+//!     #[slot(0)]
+//!     fn temperature(&self) -> Temperature;
+//! }
+//!
+//! struct OwnedReading(Temperature);
+//!
+//! impl Reading for OwnedReading {
+//!     fn temperature(&self) -> Temperature {
+//!         self.0
+//!     }
+//! }
+//!
+//! let reading = OwnedReading(Temperature { degrees: 21.5, unit: Unit::Celsius });
+//! let bytes = encode::<dyn Reading>(&reading);
+//! assert_eq!(decode::<dyn Reading>(&bytes).unwrap().temperature(), reading.0);
+//! ```
 
 #![forbid(unsafe_code)]
 
 mod list;
 mod wire;
 
+use std::fmt::Debug;
+
 pub use list::{List, ListIter, ListView, OwnedList};
 pub use wire::{FrameMark, Message, Writer};
-pub use zerialize_macros::zerializable;
+pub use zerialize_macros::{Zerializable, zerializable};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
@@ -57,6 +103,10 @@ pub enum Error {
     TrailingBytes,
     MissingField,
     RecursionLimit,
+    /// A variant number no variant of the reader's enum claims. Unlike an
+    /// unknown slot, which a reader skips by never asking for it, an enum that
+    /// gained a variant cannot be read by a reader built before it.
+    UnknownVariant,
 }
 
 pub trait Zerializable {
@@ -73,6 +123,28 @@ pub trait Zerializable {
 
     #[doc(hidden)]
     fn decode_view<'buf>(message: Message<'buf>) -> Result<Self::View<'buf>, Error>;
+}
+
+/// A field that decodes back into itself rather than into a view.
+///
+/// A value is `Copy`, so nothing it holds can borrow from the buffer, which is
+/// what lets it be read out whole: a schema's accessor hands back the value
+/// itself, not a handle over the bytes it was read from. `Debug` and
+/// `PartialEq` are required because a generated view prints and compares every
+/// field it has, including this one.
+///
+/// Implemented by `#[derive(Zerializable)]` on a `Copy` struct or enum.
+pub trait Value: Copy + Debug + PartialEq {
+    #[doc(hidden)]
+    fn encode_value(&self, writer: &mut Writer);
+
+    /// Decodes the value held by `slot` of `message`.
+    ///
+    /// A value is addressed by its slot rather than handed its bytes because it
+    /// chooses its own shape on the wire: a value enum is a scalar, a value
+    /// struct a message of its own.
+    #[doc(hidden)]
+    fn decode_value(message: Message<'_>, slot: u32) -> Result<Self, Error>;
 }
 
 /// Encodes `source` as the schema `S`.

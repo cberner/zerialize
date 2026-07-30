@@ -230,6 +230,302 @@ fn primitives_round_trip() {
     assert_eq!(view, OwnedPrimitives);
 }
 
+// Values are `Copy` types a schema holds by value. They are named outright,
+// rather than as `impl Trait`, and nothing generated for them has to be in
+// scope where the schema that holds them is.
+mod cards {
+    use zerialize::Zerializable;
+
+    #[derive(Zerializable, Copy, Clone, Debug, PartialEq)]
+    pub enum Suit {
+        #[variant(0)]
+        Clubs,
+        #[variant(1)]
+        Diamonds,
+        #[variant(2)]
+        Hearts,
+        #[variant(9)]
+        Spades,
+    }
+
+    #[derive(Zerializable, Copy, Clone, Debug, PartialEq)]
+    pub struct Card {
+        #[slot(0)]
+        pub rank: u8,
+        #[slot(1)]
+        pub suit: Suit,
+    }
+
+    #[derive(Zerializable, Copy, Clone, Debug, PartialEq)]
+    pub struct Play {
+        // A slot is the identity of a field, so a value may declare them out of
+        // order and leave gaps in them, exactly as a schema's methods may.
+        #[slot(3)]
+        pub revealed: bool,
+        #[slot(0)]
+        pub card: Card,
+        #[slot(1)]
+        pub odds: f32,
+    }
+}
+
+use cards::{Card, Play, Suit};
+
+#[zerializable]
+trait Hand {
+    #[slot(0)]
+    fn player(&self) -> &str;
+
+    #[slot(1)]
+    fn play(&self) -> Play;
+
+    #[slot(2)]
+    fn trump(&self) -> cards::Suit;
+}
+
+#[derive(Debug)]
+struct OwnedHand {
+    player: String,
+    play: Play,
+}
+
+impl Hand for OwnedHand {
+    fn player(&self) -> &str {
+        &self.player
+    }
+
+    fn play(&self) -> Play {
+        self.play
+    }
+
+    fn trump(&self) -> Suit {
+        self.play.card.suit
+    }
+}
+
+fn hand() -> OwnedHand {
+    OwnedHand {
+        player: "Ada".to_string(),
+        play: Play {
+            revealed: true,
+            card: Card {
+                rank: 12,
+                suit: Suit::Spades,
+            },
+            odds: 0.25,
+        },
+    }
+}
+
+#[test]
+fn values_round_trip() {
+    let hand = hand();
+    let encoded = encode::<dyn Hand>(&hand);
+    let view = decode::<dyn Hand>(&encoded).unwrap();
+
+    // A value decodes back into itself, so it is the same type on both sides of
+    // the wire rather than a view of the buffer.
+    assert_eq!(view.play(), hand.play);
+    assert_eq!(view.play().card.suit, Suit::Spades);
+    assert_eq!(view.trump(), Suit::Spades);
+    assert_eq!(view, hand);
+    assert!(format!("{view:?}").contains("Spades"));
+    assert_eq!(encode::<dyn Hand>(&view), encoded);
+}
+
+#[test]
+fn a_value_outlives_the_buffer_it_was_read_from() {
+    // Nothing a value holds borrows, which is what lets it escape the buffer
+    // the view that produced it is a handle over.
+    let play = {
+        let encoded = encode::<dyn Hand>(&hand());
+        decode::<dyn Hand>(&encoded).unwrap().play()
+    };
+
+    assert_eq!(play, hand().play);
+}
+
+#[test]
+fn a_value_does_not_widen_the_view_that_holds_it() {
+    let encoded = encode::<dyn Hand>(&hand());
+    let view = decode::<dyn Hand>(&encoded).unwrap();
+
+    // Values are read out of the buffer on access like every other field, so a
+    // view of them is still one slice wide.
+    assert_eq!(size_of_val(&view), size_of::<&[u8]>());
+}
+
+#[zerializable]
+trait Trumps {
+    #[slot(0)]
+    fn value(&self) -> Suit;
+}
+
+#[zerializable]
+trait Numbered {
+    #[slot(0)]
+    fn value(&self) -> u32;
+}
+
+#[test]
+fn a_value_enum_costs_what_its_number_costs() {
+    struct Trumped;
+    impl Trumps for Trumped {
+        fn value(&self) -> Suit {
+            Suit::Hearts
+        }
+    }
+
+    struct Counted;
+    impl Numbered for Counted {
+        fn value(&self) -> u32 {
+            2
+        }
+    }
+
+    // A variant number is all a unit variant carries, so an enum is written as
+    // that number rather than as a message of its own.
+    assert_eq!(
+        encode::<dyn Trumps>(&Trumped),
+        encode::<dyn Numbered>(&Counted)
+    );
+}
+
+#[test]
+fn corrupt_values_never_panic() {
+    let encoded = encode::<dyn Hand>(&hand());
+    for index in 0..encoded.len() {
+        for bit in [0x01, 0x40, 0x80] {
+            let mut corrupted = encoded.clone();
+            corrupted[index] ^= bit;
+            if let Ok(view) = decode::<dyn Hand>(&corrupted) {
+                let _ = view.play();
+                let _ = view.trump();
+            }
+        }
+    }
+}
+
+/// Value evolution: `after` adds a field to a value struct, which an older
+/// reader skips, and a variant to a value enum, which it cannot.
+mod before {
+    use zerialize::{Zerializable, zerializable};
+
+    #[derive(Zerializable, Copy, Clone, Debug, PartialEq)]
+    pub enum Color {
+        #[variant(0)]
+        Red,
+    }
+
+    #[derive(Zerializable, Copy, Clone, Debug, PartialEq)]
+    pub struct Pixel {
+        #[slot(0)]
+        pub color: Color,
+    }
+
+    #[zerializable]
+    pub trait Image {
+        #[slot(0)]
+        fn pixel(&self) -> Pixel;
+    }
+
+    pub struct OwnedImage(pub Pixel);
+
+    impl Image for OwnedImage {
+        fn pixel(&self) -> Pixel {
+            self.0
+        }
+    }
+}
+
+mod after {
+    use zerialize::{Zerializable, zerializable};
+
+    #[derive(Zerializable, Copy, Clone, Debug, PartialEq)]
+    pub enum Color {
+        #[variant(0)]
+        Red,
+        #[variant(1)]
+        Blue,
+    }
+
+    #[derive(Zerializable, Copy, Clone, Debug, PartialEq)]
+    pub struct Pixel {
+        #[slot(0)]
+        pub color: Color,
+        #[slot(1)]
+        pub alpha: u8,
+    }
+
+    #[zerializable]
+    pub trait Image {
+        #[slot(0)]
+        fn pixel(&self) -> Pixel;
+    }
+
+    pub struct OwnedImage(pub Pixel);
+
+    impl Image for OwnedImage {
+        fn pixel(&self) -> Pixel {
+            self.0
+        }
+    }
+}
+
+#[test]
+fn unknown_value_slots_are_skipped() {
+    let pixel = after::Pixel {
+        color: after::Color::Red,
+        alpha: 128,
+    };
+    let encoded = encode::<dyn after::Image>(&after::OwnedImage(pixel));
+
+    // `alpha` is a slot the older value does not know, so it is never read.
+    let view = decode::<dyn before::Image>(&encoded).unwrap();
+    assert_eq!(
+        view.pixel(),
+        before::Pixel {
+            color: before::Color::Red
+        }
+    );
+}
+
+#[test]
+fn missing_value_slots_are_rejected() {
+    let pixel = before::Pixel {
+        color: before::Color::Red,
+    };
+    let encoded = encode::<dyn before::Image>(&before::OwnedImage(pixel));
+
+    assert_eq!(
+        decode::<dyn after::Image>(&encoded).unwrap_err(),
+        Error::MissingField
+    );
+}
+
+#[test]
+fn unknown_variants_are_rejected() {
+    // Unlike a slot, which a reader skips by never asking for it, a variant it
+    // does not know is data it cannot represent.
+    let pixel = after::Pixel {
+        color: after::Color::Blue,
+        alpha: 0,
+    };
+    let encoded = encode::<dyn after::Image>(&after::OwnedImage(pixel));
+    assert_eq!(
+        decode::<dyn before::Image>(&encoded).unwrap_err(),
+        Error::UnknownVariant
+    );
+
+    // The variant it does know still decodes, out of the same slot.
+    let pixel = after::Pixel {
+        color: after::Color::Red,
+        alpha: 0,
+    };
+    let encoded = encode::<dyn after::Image>(&after::OwnedImage(pixel));
+    assert!(decode::<dyn before::Image>(&encoded).is_ok());
+}
+
 /// Schema evolution: `v2` adds a slot that `v1` readers do not know about.
 mod v1 {
     use zerialize::zerializable;
