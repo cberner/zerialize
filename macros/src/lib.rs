@@ -56,8 +56,7 @@ use syn::{
 /// * `Debug`, and `PartialEq` between any two instantiations, so that a decoded
 ///   enum compares against the value it was encoded from, and so that a message
 ///   carrying an enum can print and compare the one it holds. Deriving either is
-///   rejected: a `derive` bounds the enum's parameters, which are not what its
-///   variants carry,
+///   rejected, since it would be a second implementation of the same trait,
 /// * `as_ref`, which borrows what every variant carries, so that a message
 ///   hands out an enum it stores the way it hands out `&self.nested`.
 ///
@@ -67,10 +66,13 @@ use syn::{
 /// `Worker<PersonView<'_>>`, which is matched like any other enum. Because a
 /// variant's payload is written in terms of its parameter, a value has to be
 /// given a type where it is built:
-/// `let worker: Worker<OwnedPerson> = Worker::Engineer(person);`. For the same
-/// reason a `derive` other than the two above cannot see what an enum's
-/// payloads are: those implementations are written out, bounding the parameter
-/// by its schema trait, which is what resolves the payloads.
+/// `let worker: Worker<OwnedPerson> = Worker::Engineer(person);`.
+///
+/// Anything else the enum needs is derived as usual, on either side of the
+/// attribute: `#[derive(Clone, Hash)]` reads the same above it as below it,
+/// because a `derive` below is moved above before it is expanded. Either way
+/// the implementation is bounded by the parameters, as a `derive` writes it, so
+/// `Worker<OwnedPerson>` is `Clone` where `OwnedPerson` is.
 ///
 /// A message carries an enum by naming it the way its declaration reads,
 /// `fn role(&self) -> Worker<impl Person + '_> where Self: Sized`, so a schema
@@ -125,8 +127,10 @@ fn expand_trait(args: TokenStream, mut item: ItemTrait) -> TokenStream {
 /// generated with the rest of the expansion. Only a failed expansion emits it
 /// as it was written, which keeps the reported error to the one that matters.
 fn expand_enum(args: TokenStream, mut item: ItemEnum) -> TokenStream {
-    let expansion =
-        no_arguments(args).and_then(|()| Ok(generate_choice(&item, &parse_choice(&item)?)));
+    let expansion = no_arguments(args).and_then(|()| match hoist_derives(&item)? {
+        Some(hoisted) => Ok(hoisted),
+        None => Ok(generate_choice(&item, &parse_choice(&item)?)),
+    });
     match expansion {
         Ok(generated) => generated,
         Err(error) => {
@@ -136,6 +140,50 @@ fn expand_enum(args: TokenStream, mut item: ItemEnum) -> TokenStream {
             output
         }
     }
+}
+
+/// Moves a `#[derive]` written below `#[zerializable]` above it, by re-emitting
+/// the enum as it was declared with the order swapped.
+///
+/// Attributes expand in the order they are written, so a `derive` below the
+/// attribute is handed the rewritten enum, whose payloads are projections
+/// through `SchemaArg` that the bounds a `derive` writes cannot reach. Above
+/// it, the same `derive` sees the declaration, whose payloads are
+/// the parameters themselves, and the implementation it writes holds of the
+/// rewritten enum too, because a parameter that is `Sized` resolves its own
+/// projection. Swapping the two is therefore all it takes for either order to
+/// mean the same thing. The expansion this returns carries the attribute again,
+/// and terminates because the enum it names has no `derive` left on it.
+fn hoist_derives(item: &ItemEnum) -> Result<Option<TokenStream>, Error> {
+    let (derives, rest): (Vec<_>, Vec<_>) = item
+        .attrs
+        .iter()
+        .partition(|attribute| attribute.path().is_ident("derive"));
+    if derives.is_empty() {
+        return Ok(None);
+    }
+    for attribute in &derives {
+        reject_generated(attribute)?;
+    }
+    let mut item = item.clone();
+    item.attrs = rest.into_iter().cloned().collect();
+    Ok(Some(quote! {
+        #(#derives)*
+        #[::zerialize::zerializable]
+        #item
+    }))
+}
+
+/// Rejects deriving what the expansion implements itself, which would otherwise
+/// be reported as a pair of conflicting implementations.
+fn reject_generated(attribute: &Attribute) -> Result<(), Error> {
+    attribute.parse_nested_meta(|derived| match derived.path.get_ident() {
+        Some(derived) if GENERATED.iter().any(|name| derived == name) => Err(Error::new_spanned(
+            derived,
+            format!("#[zerializable] implements {derived} for enums itself"),
+        )),
+        _ => Ok(()),
+    })
 }
 
 fn no_arguments(args: TokenStream) -> Result<(), Error> {
@@ -330,8 +378,10 @@ const SCALARS: [&str; 11] = [
 ];
 
 /// What an enum's expansion implements, and so what deriving would collide
-/// with. Both are implementations a `derive` could not write: they are bounded
-/// by what the enum's payloads are, which only the schema knows.
+/// with. Both are what a message carrying an enum needs of it, which is why
+/// they come with the enum rather than being left to a `derive`: a view prints
+/// every field it holds, and compares them against another instantiation, which
+/// is a comparison no `derive` writes.
 const GENERATED: [&str; 2] = ["Debug", "PartialEq"];
 
 // ============================================================
@@ -619,19 +669,6 @@ fn parse_list_item(list: &PathSegment) -> Result<Nested<'_>, Error> {
 }
 
 fn parse_choice(item: &ItemEnum) -> Result<Choice<'_>, Error> {
-    for attribute in &item.attrs {
-        if attribute.path().is_ident("derive") {
-            attribute.parse_nested_meta(|derived| match derived.path.get_ident() {
-                Some(derived) if GENERATED.iter().any(|name| derived == name) => {
-                    Err(Error::new_spanned(
-                        derived,
-                        format!("#[zerializable] implements {derived} for enums itself"),
-                    ))
-                }
-                _ => Ok(()),
-            })?;
-        }
-    }
     if let Some(where_clause) = &item.generics.where_clause {
         return Err(Error::new_spanned(
             where_clause,

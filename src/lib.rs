@@ -113,6 +113,7 @@
 //! #     }
 //! # }
 //! #[zerializable]
+//! #[derive(Clone)]
 //! enum Shape<P: Point> {
 //!     #[variant(0)]
 //!     Dot(#[slot(0)] P),
@@ -120,6 +121,11 @@
 //!     Empty,
 //! }
 //!
+//! # impl Clone for OwnedPoint {
+//! #     fn clone(&self) -> Self {
+//! #         OwnedPoint { x: self.x, y: self.y }
+//! #     }
+//! # }
 //! let dot: Shape<OwnedPoint> = Shape::Dot(OwnedPoint { x: 1, y: 2 });
 //! let bytes = encode::<Shape<dyn Point>>(&dot);
 //! match decode::<Shape<dyn Point>>(&bytes).unwrap() {
@@ -134,6 +140,12 @@
 //! views, `Shape<PointView<'_>>`. Since a variant's payload is written in terms
 //! of its parameter, building a value means giving it a type, as `dot` is given
 //! one above.
+//!
+//! `Debug` and a comparison across those instantiations come with the enum,
+//! since a message carrying one prints and compares it. Everything else is
+//! derived, above the attribute or below it, and bounds the enum's parameters
+//! the way a `derive` does: `Shape<OwnedPoint>` is `Clone` where `OwnedPoint`
+//! is.
 //!
 //! A message carries an enum by naming it the way its declaration reads, as
 //! `fn shape(&self) -> Shape<impl Point + '_> where Self: Sized`, so a schema is
