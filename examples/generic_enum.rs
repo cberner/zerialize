@@ -2,10 +2,10 @@ use zerialize::*;
 
 #[zerializable]
 trait Person {
-    #[slot(0)]
+    #[n(0)]
     fn name(&self) -> &str;
 
-    #[slot(1)]
+    #[n(1)]
     fn children(&self) -> impl List<Item = impl Person + '_> + '_
     where
         Self: Sized;
@@ -15,7 +15,7 @@ trait Person {
 enum Worker<P: Person> {
     #[variant(0)]
     Engineer {
-        #[slot(0)]
+        #[n(0)]
         person: P,
     },
     #[variant(1)]

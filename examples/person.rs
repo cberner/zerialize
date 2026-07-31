@@ -3,15 +3,15 @@ use zerialize::*;
 
 #[zerializable]
 trait Person {
-    #[slot(0)]
+    #[n(0)]
     fn name(&self) -> &str;
 
-    #[slot(1)]
+    #[n(1)]
     fn children(&self) -> impl List<Item = impl Person + '_> + '_
     where
         Self: Sized;
 
-    #[slot(2)]
+    #[n(2)]
     fn date_of_birth(&self) -> DateOfBirth;
 }
 
@@ -45,11 +45,11 @@ enum Month {
 
 #[derive(Zerializable, Copy, Clone, PartialEq, Eq, Debug)]
 struct DateOfBirth {
-    #[slot(0)]
+    #[n(0)]
     day: u8,
-    #[slot(1)]
+    #[n(1)]
     month: Month,
-    #[slot(2)]
+    #[n(2)]
     year: u16,
 }
 

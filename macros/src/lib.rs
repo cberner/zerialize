@@ -20,7 +20,7 @@ use syn::{
 /// # Traits
 ///
 /// A trait is a message. Every method must declare the slot it occupies with
-/// `#[slot(N)]`. Slots are the identity of a field on the wire, so renaming or
+/// `#[n(N)]`. Slots are the identity of a field on the wire, so renaming or
 /// reordering methods is safe, and a reader skips slots it does not know about.
 ///
 /// The macro generates, alongside the trait:
@@ -53,7 +53,7 @@ use syn::{
 ///
 /// An enum is a choice between messages. Every variant must declare the tag
 /// that names it with `#[variant(N)]`, and every field of a variant the slot it
-/// occupies with `#[slot(N)]`. A field is either a scalar or one of the enum's
+/// occupies with `#[n(N)]`. A field is either a scalar or one of the enum's
 /// parameters, each of which stands for a nested schema and so must be bound by
 /// the trait declaring it. A variant carries nothing, a tuple of fields, or
 /// named fields, and is built and matched the way it was declared. Naming a
@@ -126,9 +126,9 @@ pub fn zerializable(
 fn expand_trait(args: TokenStream, mut item: ItemTrait) -> TokenStream {
     let expansion = parse_arguments(args, true)
         .and_then(|derived| Ok(generate_schema(&parse_schema(&item)?, derived)));
-    // `#[slot(N)]` is consumed here, so it must be stripped from the trait even
+    // `#[n(N)]` is consumed here, so it must be stripped from the trait even
     // when the rest of the expansion fails, or the reported error would be a
-    // confusing "cannot find attribute `slot`".
+    // confusing "cannot find attribute `n`".
     for trait_item in &mut item.items {
         match trait_item {
             TraitItem::Const(item) => strip(&mut item.attrs),
@@ -311,7 +311,7 @@ fn strip_variant_attributes(item: &mut ItemEnum) {
 /// and which decoding hands back as itself rather than as a view.
 ///
 /// A value struct declares the slot each of its fields occupies with
-/// `#[slot(N)]`, exactly as a schema's methods do, and a value enum declares
+/// `#[n(N)]`, exactly as a schema's methods do, and a value enum declares
 /// the number each of its variants is written as with `#[variant(N)]`. Both are
 /// the identity of what they name on the wire, so renaming and reordering are
 /// safe, and a struct may gain fields without breaking readers built against
@@ -321,7 +321,7 @@ fn strip_variant_attributes(item: &mut ItemEnum) {
 /// nothing it holds can borrow from the buffer it was read from. Nothing more
 /// is asked of the type, but a schema asked to print or compare its fields asks
 /// it of this one too, so a value a printed view carries must be `Debug`.
-#[proc_macro_derive(Zerializable, attributes(slot, variant))]
+#[proc_macro_derive(Zerializable, attributes(n, variant))]
 pub fn derive_zerializable(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let item = match syn::parse::<DeriveInput>(item) {
         Ok(item) => item,
@@ -338,7 +338,7 @@ pub fn derive_zerializable(item: proc_macro::TokenStream) -> proc_macro::TokenSt
 /// compiler knows.
 fn strip(attributes: &mut Vec<Attribute>) {
     attributes.retain(|attribute| {
-        !(attribute.path().is_ident("slot") || attribute.path().is_ident("variant"))
+        !(attribute.path().is_ident("n") || attribute.path().is_ident("variant"))
     });
 }
 
@@ -551,7 +551,7 @@ fn require_no_generics(generics: &Generics, what: &str) -> Result<(), Error> {
 /// Parses one method, given the methods of the same trait already parsed, which
 /// is what a slot is checked for uniqueness against.
 fn parse_method<'a>(function: &'a TraitItemFn, parsed: &[Method<'a>]) -> Result<Method<'a>, Error> {
-    let declared = declared_number(&function.attrs, "slot")?;
+    let declared = declared_number(&function.attrs, "n")?;
 
     function.modifiers.require_empty()?;
     if let Some(default) = &function.default {
@@ -603,7 +603,7 @@ fn parse_method<'a>(function: &'a TraitItemFn, parsed: &[Method<'a>]) -> Result<
     let Some((slot, attribute)) = declared else {
         return Err(Error::new_spanned(
             signature,
-            "every #[zerializable] method requires a #[slot(N)] attribute",
+            "every #[zerializable] method requires a #[n(N)] attribute",
         ));
     };
     if let Some(previous) = parsed.iter().find(|method| method.slot == slot) {
@@ -908,10 +908,10 @@ fn parse_case_field<'a>(
 ) -> Result<CaseField<'a>, Error> {
     let payload = parse_payload(&field.ty, params)?;
 
-    let Some((slot, attribute)) = declared_number(&field.attrs, "slot")? else {
+    let Some((slot, attribute)) = declared_number(&field.attrs, "n")? else {
         return Err(Error::new_spanned(
             field,
-            "every field of a #[zerializable] variant requires a #[slot(N)] attribute",
+            "every field of a #[zerializable] variant requires a #[n(N)] attribute",
         ));
     };
     if let Some(index) = parsed.iter().position(|other| other.slot == slot) {
@@ -1685,10 +1685,10 @@ fn parse_fields(data: &DataStruct) -> Result<Vec<Field<'_>>, Error> {
 
     let mut parsed: Vec<Field<'_>> = Vec::new();
     for field in fields {
-        let Some((slot, attribute)) = declared_number(&field.attrs, "slot")? else {
+        let Some((slot, attribute)) = declared_number(&field.attrs, "n")? else {
             return Err(Error::new_spanned(
                 field,
-                "every field of a #[derive(Zerializable)] struct requires a #[slot(N)] attribute",
+                "every field of a #[derive(Zerializable)] struct requires a #[n(N)] attribute",
             ));
         };
         if let Some(previous) = parsed.iter().find(|other| other.slot == slot) {
