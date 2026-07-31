@@ -12,7 +12,7 @@ mod location {
         fn zip(&self) -> u32;
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
     pub struct OwnedAddress {
         pub city: String,
         pub zip: u32,
@@ -825,6 +825,56 @@ fn corrupt_enum_input_never_panics() {
             }
         }
     }
+}
+
+/// The same declaration twice, with a `#[derive]` on either side of the
+/// attribute, since the two are meant to read alike.
+#[zerializable]
+#[derive(Clone, Default, Eq, Hash, PartialOrd, Ord)]
+enum Tenancy<A: Address> {
+    #[variant(0)]
+    #[default]
+    Vacant,
+    #[variant(1)]
+    Leased(#[slot(0)] A, #[slot(1)] u32),
+}
+
+#[derive(Clone, Default, Eq, Hash, PartialOrd, Ord)]
+#[zerializable]
+enum Tenancy2<A: Address> {
+    #[variant(0)]
+    #[default]
+    Vacant,
+    #[variant(1)]
+    Leased(#[slot(0)] A, #[slot(1)] u32),
+}
+
+#[test]
+fn an_enum_derives_on_either_side_of_the_attribute() {
+    let oakland = OwnedAddress {
+        city: "Oakland".to_string(),
+        zip: 94607,
+    };
+    let below: Tenancy<OwnedAddress> = Tenancy::Leased(oakland.clone(), 12);
+    let above: Tenancy2<OwnedAddress> = Tenancy2::Leased(oakland, 12);
+
+    // Each implementation is bounded by the enum's parameters, as a `derive`
+    // writes it, so it holds of the enum over any payload that has it.
+    assert_eq!(below.clone(), below);
+    assert_eq!(above.clone(), above);
+    assert_eq!(Tenancy::<OwnedAddress>::default(), Tenancy::Vacant);
+    assert_eq!(Tenancy2::<OwnedAddress>::default(), Tenancy2::Vacant);
+    assert!(below > Tenancy::Vacant);
+    assert!(above > Tenancy2::Vacant);
+    let mut leases = std::collections::HashSet::new();
+    assert!(leases.insert(below.clone()));
+    assert!(!leases.insert(below.clone()));
+
+    // What the attribute generates is untouched by any of it.
+    let encoded = encode::<Tenancy<dyn Address>>(&below);
+    assert_eq!(decode::<Tenancy<dyn Address>>(&encoded).unwrap(), below);
+    let encoded = encode::<Tenancy2<dyn Address>>(&above);
+    assert_eq!(decode::<Tenancy2<dyn Address>>(&encoded).unwrap(), above);
 }
 
 /// A message carrying enums: one on its own, and one per element of a list.
