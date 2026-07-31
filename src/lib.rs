@@ -141,11 +141,51 @@
 //! of its parameter, building a value means giving it a type, as `dot` is given
 //! one above.
 //!
-//! `Debug` and a comparison across those instantiations come with the enum,
-//! since a message carrying one prints and compares it. Everything else is
-//! derived, above the attribute or below it, and bounds the enum's parameters
-//! the way a `derive` does: `Shape<OwnedPoint>` is `Clone` where `OwnedPoint`
-//! is.
+//! The enum is otherwise an ordinary enum, so what it needs is derived, above
+//! the attribute or below it, bounding the enum's parameters the way a `derive`
+//! does: `Shape<OwnedPoint>` is `Clone` where `OwnedPoint` is.
+//!
+//! # Printing and comparing
+//!
+//! A schema is asked for those rather than given them, because both are
+//! implementations on its own types that a schema which is never printed or
+//! compared has no use for:
+//!
+//! ```
+//! use zerialize::{decode, encode, zerializable};
+//!
+//! #[zerializable(derive(Debug, PartialEq))]
+//! trait Point {
+//!     #[slot(0)]
+//!     fn x(&self) -> i32;
+//! }
+//!
+//! # #[derive(Debug)]
+//! struct OwnedPoint(i32);
+//! # impl Point for OwnedPoint {
+//! #     fn x(&self) -> i32 {
+//! #         self.0
+//! #     }
+//! # }
+//!
+//! let point = OwnedPoint(1);
+//! let bytes = encode::<dyn Point>(&point);
+//! assert_eq!(decode::<dyn Point>(&bytes).unwrap(), point);
+//! ```
+//!
+//! A view compares against *any* implementation of its schema, which is what
+//! makes the assertion above read the way it does, and prints the fields it
+//! stands for rather than the bytes it holds. Neither is an implementation that
+//! could be written outside the schema, and asking for either asks the same of
+//! the schemas and values that schema carries.
+//!
+//! A choice asks for `PartialEq` the same way, and means something stronger by
+//! it: `#[zerializable(derive(PartialEq))]` compares any two instantiations, so
+//! that `Shape<PointView<'_>>` compares against the `Shape<OwnedPoint>` it was
+//! encoded from. That is the one implementation a `derive` cannot write, and it
+//! covers the ordinary case as well, so `#[derive(PartialEq)]` is rejected
+//! beside it. `Debug` is not offered there: an enum is declared by its author,
+//! so it is printed by an ordinary `#[derive(Debug)]`.
 //!
 //! A message carries an enum by naming it the way its declaration reads, as
 //! `fn shape(&self) -> Shape<impl Point + '_> where Self: Sized`, so a schema is
@@ -155,8 +195,6 @@
 
 mod list;
 mod wire;
-
-use std::fmt::Debug;
 
 pub use list::{List, ListIter, ListView, OwnedList};
 pub use wire::{FrameMark, Message, Writer};
@@ -196,12 +234,13 @@ pub trait Zerializable {
 ///
 /// A value is `Copy`, so nothing it holds can borrow from the buffer, which is
 /// what lets it be read out whole: a schema's accessor hands back the value
-/// itself, not a handle over the bytes it was read from. `Debug` and
-/// `PartialEq` are required because a generated view prints and compares every
-/// field it has, including this one.
+/// itself, not a handle over the bytes it was read from. Nothing more is
+/// required of it: a schema asked to print or compare its fields needs this one
+/// to be `Debug` or `PartialEq`, but a schema that is asked for neither does
+/// not.
 ///
 /// Implemented by `#[derive(Zerializable)]` on a `Copy` struct or enum.
-pub trait Value: Copy + Debug + PartialEq {
+pub trait Value: Copy {
     #[doc(hidden)]
     fn encode_value(&self, writer: &mut Writer);
 
