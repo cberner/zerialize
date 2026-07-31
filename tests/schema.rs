@@ -5,10 +5,10 @@ mod location {
 
     #[zerializable(derive(Debug, PartialEq))]
     pub trait Address {
-        #[slot(0)]
+        #[n(0)]
         fn city(&self) -> &str;
 
-        #[slot(1)]
+        #[n(1)]
         fn zip(&self) -> u32;
     }
 
@@ -35,15 +35,15 @@ use location::{Address, OwnedAddress};
 
 #[zerializable(derive(Debug, PartialEq))]
 trait Person {
-    #[slot(0)]
+    #[n(0)]
     fn name(&self) -> &str;
 
-    #[slot(1)]
+    #[n(1)]
     fn children(&self) -> impl List<Item = impl Person + '_> + '_
     where
         Self: Sized;
 
-    #[slot(2)]
+    #[n(2)]
     fn address(&self) -> impl Address + '_
     where
         Self: Sized;
@@ -176,19 +176,19 @@ fn view_re_encodes_identically() {
 
 #[zerializable(derive(Debug, PartialEq))]
 trait Primitives {
-    #[slot(0)]
+    #[n(0)]
     fn flag(&self) -> bool;
 
-    #[slot(1)]
+    #[n(1)]
     fn small(&self) -> u8;
 
-    #[slot(2)]
+    #[n(2)]
     fn signed(&self) -> i64;
 
-    #[slot(3)]
+    #[n(3)]
     fn ratio(&self) -> f64;
 
-    #[slot(4)]
+    #[n(4)]
     fn blob(&self) -> &[u8];
 }
 
@@ -250,9 +250,9 @@ mod cards {
 
     #[derive(Zerializable, Copy, Clone, Debug, PartialEq)]
     pub struct Card {
-        #[slot(0)]
+        #[n(0)]
         pub rank: u8,
-        #[slot(1)]
+        #[n(1)]
         pub suit: Suit,
     }
 
@@ -260,11 +260,11 @@ mod cards {
     pub struct Play {
         // A slot is the identity of a field, so a value may declare them out of
         // order and leave gaps in them, exactly as a schema's methods may.
-        #[slot(3)]
+        #[n(3)]
         pub revealed: bool,
-        #[slot(0)]
+        #[n(0)]
         pub card: Card,
-        #[slot(1)]
+        #[n(1)]
         pub odds: f32,
     }
 }
@@ -273,13 +273,13 @@ use cards::{Card, Play, Suit};
 
 #[zerializable(derive(Debug, PartialEq))]
 trait Hand {
-    #[slot(0)]
+    #[n(0)]
     fn player(&self) -> &str;
 
-    #[slot(1)]
+    #[n(1)]
     fn play(&self) -> Play;
 
-    #[slot(2)]
+    #[n(2)]
     fn trump(&self) -> cards::Suit;
 }
 
@@ -357,13 +357,13 @@ fn a_value_does_not_widen_the_view_that_holds_it() {
 
 #[zerializable(derive(Debug, PartialEq))]
 trait Trumps {
-    #[slot(0)]
+    #[n(0)]
     fn value(&self) -> Suit;
 }
 
 #[zerializable(derive(Debug, PartialEq))]
 trait Numbered {
-    #[slot(0)]
+    #[n(0)]
     fn value(&self) -> u32;
 }
 
@@ -419,13 +419,13 @@ mod before {
 
     #[derive(Zerializable, Copy, Clone, Debug, PartialEq)]
     pub struct Pixel {
-        #[slot(0)]
+        #[n(0)]
         pub color: Color,
     }
 
     #[zerializable(derive(Debug, PartialEq))]
     pub trait Image {
-        #[slot(0)]
+        #[n(0)]
         fn pixel(&self) -> Pixel;
     }
 
@@ -451,15 +451,15 @@ mod after {
 
     #[derive(Zerializable, Copy, Clone, Debug, PartialEq)]
     pub struct Pixel {
-        #[slot(0)]
+        #[n(0)]
         pub color: Color,
-        #[slot(1)]
+        #[n(1)]
         pub alpha: u8,
     }
 
     #[zerializable(derive(Debug, PartialEq))]
     pub trait Image {
-        #[slot(0)]
+        #[n(0)]
         fn pixel(&self) -> Pixel;
     }
 
@@ -532,7 +532,7 @@ mod v1 {
 
     #[zerializable(derive(Debug, PartialEq))]
     pub trait Record {
-        #[slot(0)]
+        #[n(0)]
         fn id(&self) -> u32;
     }
 }
@@ -542,10 +542,10 @@ mod v2 {
 
     #[zerializable(derive(Debug, PartialEq))]
     pub trait Record {
-        #[slot(0)]
+        #[n(0)]
         fn id(&self) -> u32;
 
-        #[slot(7)]
+        #[n(7)]
         fn label(&self) -> &str;
     }
 
@@ -702,9 +702,9 @@ fn view_is_a_thin_handle() {
 #[derive(Debug)]
 enum Role<P: Person, A: Address> {
     #[variant(0)]
-    Resident(#[slot(0)] P),
+    Resident(#[n(0)] P),
     #[variant(1)]
-    Office(#[slot(0)] A, #[slot(1)] u32),
+    Office(#[n(0)] A, #[n(1)] u32),
     #[variant(2)]
     Vacant,
 }
@@ -836,14 +836,14 @@ fn corrupt_enum_input_never_panics() {
 enum Tenant<P: Person, A: Address> {
     #[variant(0)]
     Resident {
-        #[slot(0)]
+        #[n(0)]
         person: P,
     },
     #[variant(1)]
     Office {
-        #[slot(0)]
+        #[n(0)]
         address: A,
-        #[slot(1)]
+        #[n(1)]
         floor: u32,
     },
     #[variant(2)]
@@ -928,7 +928,7 @@ enum Vacancy<A: Address> {
     Named {},
     #[variant(3)]
     Taken {
-        #[slot(0)]
+        #[n(0)]
         address: A,
     },
 }
@@ -969,16 +969,16 @@ mod plain {
     /// have: only a schema asked to print or compare its fields needs them.
     #[derive(Zerializable, Copy, Clone)]
     pub struct Weight {
-        #[slot(0)]
+        #[n(0)]
         pub grams: u32,
     }
 
     #[zerializable]
     pub trait Note {
-        #[slot(0)]
+        #[n(0)]
         fn text(&self) -> &str;
 
-        #[slot(1)]
+        #[n(1)]
         fn weight(&self) -> Weight;
     }
 
@@ -988,7 +988,7 @@ mod plain {
     #[derive(Debug, Clone, PartialEq)]
     pub enum Entry<N: Note> {
         #[variant(0)]
-        Written(#[slot(0)] N),
+        Written(#[n(0)] N),
         #[variant(1)]
         Blank,
     }
@@ -1040,7 +1040,7 @@ enum Tenancy<A: Address> {
     #[default]
     Vacant,
     #[variant(1)]
-    Leased(#[slot(0)] A, #[slot(1)] u32),
+    Leased(#[n(0)] A, #[n(1)] u32),
 }
 
 #[derive(Clone, Default, Eq, Hash, PartialOrd, Ord)]
@@ -1051,7 +1051,7 @@ enum Tenancy2<A: Address> {
     #[default]
     Vacant,
     #[variant(1)]
-    Leased(#[slot(0)] A, #[slot(1)] u32),
+    Leased(#[n(0)] A, #[n(1)] u32),
 }
 
 #[test]
@@ -1085,12 +1085,12 @@ fn an_enum_derives_on_either_side_of_the_attribute() {
 /// A message carrying enums: one on its own, and one per element of a list.
 #[zerializable(derive(Debug, PartialEq))]
 trait Building {
-    #[slot(0)]
+    #[n(0)]
     fn owner(&self) -> Role<impl Person + '_, impl Address + '_>
     where
         Self: Sized;
 
-    #[slot(1)]
+    #[n(1)]
     fn tenants(&self) -> impl List<Item = Role<impl Person + '_, impl Address + '_>> + '_
     where
         Self: Sized;
@@ -1228,7 +1228,7 @@ mod command_v1 {
     #[derive(Debug)]
     pub enum Command {
         #[variant(0)]
-        Wait(#[slot(0)] u32),
+        Wait(#[n(0)] u32),
     }
 }
 
@@ -1239,7 +1239,7 @@ mod command_v2 {
     #[derive(Debug)]
     pub enum Command {
         #[variant(0)]
-        Wait(#[slot(0)] u32, #[slot(1)] bool),
+        Wait(#[n(0)] u32, #[n(1)] bool),
         #[variant(1)]
         Stop,
     }

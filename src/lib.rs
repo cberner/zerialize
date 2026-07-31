@@ -8,10 +8,10 @@
 //!
 //! #[zerializable]
 //! trait Point {
-//!     #[slot(0)]
+//!     #[n(0)]
 //!     fn x(&self) -> i32;
 //!
-//!     #[slot(1)]
+//!     #[n(1)]
 //!     fn y(&self) -> i32;
 //! }
 //!
@@ -59,15 +59,15 @@
 //!
 //! #[derive(Zerializable, Copy, Clone, Debug, PartialEq)]
 //! struct Temperature {
-//!     #[slot(0)]
+//!     #[n(0)]
 //!     degrees: f32,
-//!     #[slot(1)]
+//!     #[n(1)]
 //!     unit: Unit,
 //! }
 //!
 //! #[zerializable]
 //! trait Reading {
-//!     #[slot(0)]
+//!     #[n(0)]
 //!     fn temperature(&self) -> Temperature;
 //! }
 //!
@@ -95,9 +95,9 @@
 //!
 //! # #[zerializable]
 //! # trait Point {
-//! #     #[slot(0)]
+//! #     #[n(0)]
 //! #     fn x(&self) -> i32;
-//! #     #[slot(1)]
+//! #     #[n(1)]
 //! #     fn y(&self) -> i32;
 //! # }
 //! # struct OwnedPoint {
@@ -116,7 +116,7 @@
 //! #[derive(Clone)]
 //! enum Shape<P: Point> {
 //!     #[variant(0)]
-//!     Dot(#[slot(0)] P),
+//!     Dot(#[n(0)] P),
 //!     #[variant(1)]
 //!     Empty,
 //! }
@@ -142,7 +142,7 @@
 //! one above.
 //!
 //! A variant carries nothing, a tuple of fields, or named fields, and is built
-//! and matched the way it was declared: written `Dot { #[slot(0)] at: P }`, the
+//! and matched the way it was declared: written `Dot { #[n(0)] at: P }`, the
 //! variant above is built and matched as `Shape::Dot { at }`. What names a
 //! field on the wire is its slot either way, so naming a field, or renaming
 //! one, changes how the enum reads rather than what it encodes as.
@@ -162,7 +162,7 @@
 //!
 //! #[zerializable(derive(Debug, PartialEq))]
 //! trait Point {
-//!     #[slot(0)]
+//!     #[n(0)]
 //!     fn x(&self) -> i32;
 //! }
 //!
