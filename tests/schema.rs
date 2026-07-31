@@ -828,6 +828,139 @@ fn corrupt_enum_input_never_panics() {
     }
 }
 
+/// The same choice as `Role`, with the fields of each variant named rather than
+/// positional. A slot is what names a field on the wire, so the two are one
+/// schema; the names are how the enum reads in Rust.
+#[zerializable(derive(PartialEq))]
+#[derive(Debug)]
+enum Tenant<P: Person, A: Address> {
+    #[variant(0)]
+    Resident {
+        #[slot(0)]
+        person: P,
+    },
+    #[variant(1)]
+    Office {
+        #[slot(0)]
+        address: A,
+        #[slot(1)]
+        floor: u32,
+    },
+    #[variant(2)]
+    Vacant,
+}
+
+fn tenant_office() -> Tenant<OwnedPerson, OwnedAddress> {
+    Tenant::Office {
+        address: OwnedAddress {
+            city: "Oakland".to_string(),
+            zip: 94607,
+        },
+        floor: 12,
+    }
+}
+
+#[test]
+fn a_variant_may_name_its_fields() {
+    let resident: Tenant<OwnedPerson, OwnedAddress> = Tenant::Resident { person: family() };
+    let encoded = encode::<Tenant<dyn Person, dyn Address>>(&resident);
+
+    match decode::<Tenant<dyn Person, dyn Address>>(&encoded).unwrap() {
+        Tenant::Resident { person } => {
+            assert_eq!(person.name(), "John");
+            assert_eq!(person.children().len(), 2);
+        }
+        _ => panic!("decoded the wrong variant"),
+    }
+}
+
+#[test]
+fn naming_a_field_leaves_the_wire_alone() {
+    // What names a field on the wire is its slot, so a variant that names its
+    // fields and one that does not are the same message: either writes what
+    // the other reads.
+    let positional = encode::<Role<dyn Person, dyn Address>>(&office());
+    assert_eq!(
+        encode::<Tenant<dyn Person, dyn Address>>(&tenant_office()),
+        positional
+    );
+    match decode::<Tenant<dyn Person, dyn Address>>(&positional).unwrap() {
+        Tenant::Office { address, floor } => {
+            assert_eq!(address.city(), "Oakland");
+            assert_eq!(address.zip(), 94607);
+            assert_eq!(floor, 12);
+        }
+        _ => panic!("decoded the wrong variant"),
+    }
+}
+
+#[test]
+fn a_named_variant_is_borrowed_and_compared_like_any_other() {
+    let stored = tenant_office();
+
+    let borrowed: Tenant<&OwnedPerson, &OwnedAddress> = stored.as_ref();
+    let encoded = encode::<Tenant<dyn Person, dyn Address>>(&stored);
+    assert_eq!(
+        encode::<Tenant<dyn Person, dyn Address>>(&borrowed),
+        encoded
+    );
+
+    // The comparison across instantiations: the enum over views, against the
+    // enum over the implementation it was encoded from.
+    assert_eq!(
+        decode::<Tenant<dyn Person, dyn Address>>(&encoded).unwrap(),
+        stored
+    );
+
+    let vacant: Tenant<OwnedPerson, OwnedAddress> = Tenant::Vacant;
+    assert!(matches!(vacant.as_ref(), Tenant::Vacant));
+}
+
+/// A choice whose empty variants are each written a different way.
+#[zerializable]
+#[derive(Debug, Clone, PartialEq)]
+enum Vacancy<A: Address> {
+    #[variant(0)]
+    Unit,
+    #[variant(1)]
+    Tuple(),
+    #[variant(2)]
+    Named {},
+    #[variant(3)]
+    Taken {
+        #[slot(0)]
+        address: A,
+    },
+}
+
+#[test]
+fn a_variant_carrying_nothing_keeps_the_shape_it_was_written_with() {
+    // `V`, `V()`, and `V {}` are three different declarations to Rust even
+    // where all three carry nothing, so each is built and matched as written.
+    let unit: Vacancy<OwnedAddress> = Vacancy::Unit;
+    let tuple: Vacancy<OwnedAddress> = Vacancy::Tuple();
+    let named: Vacancy<OwnedAddress> = Vacancy::Named {};
+
+    let encoded = encode::<Vacancy<dyn Address>>(&unit);
+    let decoded = decode::<Vacancy<dyn Address>>(&encoded).unwrap();
+    assert!(matches!(decoded, Vacancy::Unit));
+    let encoded = encode::<Vacancy<dyn Address>>(&tuple);
+    let decoded = decode::<Vacancy<dyn Address>>(&encoded).unwrap();
+    assert!(matches!(decoded, Vacancy::Tuple()));
+    let encoded = encode::<Vacancy<dyn Address>>(&named);
+    let decoded = decode::<Vacancy<dyn Address>>(&encoded).unwrap();
+    assert!(matches!(decoded, Vacancy::Named {}));
+
+    assert!(matches!(tuple.as_ref(), Vacancy::Tuple()));
+    assert!(matches!(named.as_ref(), Vacancy::Named {}));
+
+    // What an ordinary `derive` writes, hoisted above the attribute, over the
+    // variants it rewrote.
+    assert_eq!(named.clone(), named);
+    assert_ne!(named, unit);
+    assert!(format!("{named:?}").contains("Named"));
+}
+
 /// A schema that asks for nothing, which is what a schema costs by default.
 mod plain {
     use zerialize::{Zerializable, zerializable};

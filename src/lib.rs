@@ -141,6 +141,12 @@
 //! of its parameter, building a value means giving it a type, as `dot` is given
 //! one above.
 //!
+//! A variant carries nothing, a tuple of fields, or named fields, and is built
+//! and matched the way it was declared: written `Dot { #[slot(0)] at: P }`, the
+//! variant above is built and matched as `Shape::Dot { at }`. What names a
+//! field on the wire is its slot either way, so naming a field, or renaming
+//! one, changes how the enum reads rather than what it encodes as.
+//!
 //! The enum is otherwise an ordinary enum, so what it needs is derived, above
 //! the attribute or below it, bounding the enum's parameters the way a `derive`
 //! does: `Shape<OwnedPoint>` is `Clone` where `OwnedPoint` is.

@@ -55,7 +55,10 @@ use syn::{
 /// that names it with `#[variant(N)]`, and every field of a variant the slot it
 /// occupies with `#[slot(N)]`. A field is either a scalar or one of the enum's
 /// parameters, each of which stands for a nested schema and so must be bound by
-/// the trait declaring it.
+/// the trait declaring it. A variant carries nothing, a tuple of fields, or
+/// named fields, and is built and matched the way it was declared. Naming a
+/// field changes how the enum reads rather than what it encodes as, since a
+/// slot is what names a field on the wire.
 ///
 /// The macro generates, from the enum:
 ///
@@ -373,10 +376,24 @@ struct Case<'a> {
     name: &'a Ident,
     tag: u32,
     fields: Vec<CaseField<'a>>,
+    style: Style,
+}
+
+/// How a variant is written, which is how it has to be matched and built: `V`,
+/// `V(..)`, and `V { .. }` are three different declarations to Rust, even where
+/// they carry the same fields.
+#[derive(Clone, Copy)]
+enum Style {
+    Unit,
+    Tuple,
+    Named,
 }
 
 struct CaseField<'a> {
     slot: u32,
+    /// The field's own name, where its variant gives it one. What names a field
+    /// on the wire is its slot, so this is only how the field is written.
+    name: Option<&'a Ident>,
     payload: Payload<'a>,
 }
 
@@ -853,20 +870,14 @@ fn parse_case<'a>(
         ));
     }
 
+    let style = match &variant.fields {
+        Fields::Unit => Style::Unit,
+        Fields::Unnamed(_) => Style::Tuple,
+        Fields::Named(_) => Style::Named,
+    };
     let mut fields = Vec::new();
-    match &variant.fields {
-        Fields::Unit => {}
-        Fields::Unnamed(unnamed) => {
-            for field in &unnamed.unnamed {
-                fields.push(parse_case_field(field, params, &fields)?);
-            }
-        }
-        Fields::Named(named) => {
-            return Err(Error::new_spanned(
-                named,
-                "#[zerializable] variants must be unit or tuple variants",
-            ));
-        }
+    for field in &variant.fields {
+        fields.push(parse_case_field(field, params, &fields)?);
     }
 
     let Some((tag, attribute)) = declared_number(&variant.attrs, "variant")? else {
@@ -886,6 +897,7 @@ fn parse_case<'a>(
         name: &variant.ident,
         tag,
         fields,
+        style,
     })
 }
 
@@ -902,14 +914,22 @@ fn parse_case_field<'a>(
             "every field of a #[zerializable] variant requires a #[slot(N)] attribute",
         ));
     };
-    if let Some(previous) = parsed.iter().position(|field| field.slot == slot) {
+    if let Some(index) = parsed.iter().position(|other| other.slot == slot) {
+        let previous = match parsed[index].name {
+            Some(name) => format!("`{name}`"),
+            None => format!("field {index}"),
+        };
         return Err(Error::new_spanned(
             attribute,
-            format!("slot {slot} is already used by field {previous}"),
+            format!("slot {slot} is already used by {previous}"),
         ));
     }
 
-    Ok(CaseField { slot, payload })
+    Ok(CaseField {
+        slot,
+        name: field.ident.as_ref(),
+        payload,
+    })
 }
 
 fn parse_payload<'a>(ty: &'a Type, params: &[Param<'a>]) -> Result<Payload<'a>, Error> {
@@ -1364,31 +1384,37 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
 
     let decoded = variants.iter().map(|variant| {
         let tag = Literal::u32_suffixed(variant.tag);
-        let variant_name = variant.name;
-        if variant.fields.is_empty() {
-            return quote!(#tag => ::core::result::Result::Ok(#name::#variant_name),);
-        }
-        let read = variant.fields.iter().map(|field| {
-            let slot = Literal::u32_suffixed(field.slot);
-            match &field.payload {
-                Payload::Scalar(scalar) => {
-                    let read = format_ident!("read_{}", scalar);
-                    quote!(__payload.#read(#slot)?)
-                }
-                Payload::Nested(carried) => {
-                    let schema = schema_of(Nested::Message(carried.schema));
-                    quote! {
-                        <#schema as ::zerialize::Zerializable>::decode_view(
-                            __payload.read_message(#slot)?,
-                        )?
+        let read = variant
+            .fields
+            .iter()
+            .map(|field| {
+                let slot = Literal::u32_suffixed(field.slot);
+                match &field.payload {
+                    Payload::Scalar(scalar) => {
+                        let read = format_ident!("read_{}", scalar);
+                        quote!(__payload.#read(#slot)?)
+                    }
+                    Payload::Nested(carried) => {
+                        let schema = schema_of(Nested::Message(carried.schema));
+                        quote! {
+                            <#schema as ::zerialize::Zerializable>::decode_view(
+                                __payload.read_message(#slot)?,
+                            )?
+                        }
                     }
                 }
-            }
-        });
+            })
+            .collect::<Vec<_>>();
+        let built = construct(name, variant, &read);
+        // A variant carrying nothing was written without a payload, so there is
+        // none to read here either.
+        if variant.fields.is_empty() {
+            return quote!(#tag => ::core::result::Result::Ok(#built),);
+        }
         quote! {
             #tag => {
                 let __payload = __message.read_payload()?;
-                ::core::result::Result::Ok(#name::#variant_name(#(#read),*))
+                ::core::result::Result::Ok(#built)
             }
         }
     });
@@ -1428,21 +1454,22 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
     );
     let borrowed = variants.iter().map(|variant| {
         let pattern = pattern(name, variant, "__field");
-        let variant_name = variant.name;
-        let fields = variant.fields.iter().enumerate().map(|(index, field)| {
-            let binding = binding("__field", index);
-            match &field.payload {
-                // A scalar is carried by value, so a reference to one is not
-                // what the borrowed enum holds.
-                Payload::Scalar(_) => quote!(*#binding),
-                Payload::Nested(_) => quote!(#binding),
-            }
-        });
-        if variant.fields.is_empty() {
-            quote!(#pattern => #name::#variant_name,)
-        } else {
-            quote!(#pattern => #name::#variant_name(#(#fields),*),)
-        }
+        let fields = variant
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                let binding = binding("__field", index);
+                match &field.payload {
+                    // A scalar is carried by value, so a reference to one is not
+                    // what the borrowed enum holds.
+                    Payload::Scalar(_) => quote!(*#binding),
+                    Payload::Nested(_) => quote!(#binding),
+                }
+            })
+            .collect::<Vec<_>>();
+        let built = construct(name, variant, &fields);
+        quote!(#pattern => #built,)
     });
     let borrowing = format!(
         "Borrows what every variant carries, so that a `{name}` an \
@@ -1561,21 +1588,37 @@ fn declaration(item: &ItemEnum, params: &[Param<'_>]) -> TokenStream {
     item.into_token_stream()
 }
 
-/// What a field is bound to when its variant is matched, since the fields of a
-/// tuple variant have no names of their own.
+/// What a field is bound to when its variant is matched. A field is bound by
+/// position rather than by whatever it is called, so that every variant is
+/// matched the same way whether or not its fields are named.
 fn binding(prefix: &str, index: usize) -> Ident {
     format_ident!("{}{}", prefix, index)
 }
 
+/// One variant over whatever its fields are given, written the way it was
+/// declared. The same shape is both the expression building a variant and the
+/// pattern matching it, which is what lets one function write either.
+fn construct<T: ToTokens>(name: &Ident, variant: &Case<'_>, values: &[T]) -> TokenStream {
+    let variant_name = variant.name;
+    match variant.style {
+        Style::Unit => quote!(#name::#variant_name),
+        Style::Tuple => quote!(#name::#variant_name(#(#values),*)),
+        Style::Named => {
+            let names = variant
+                .fields
+                .iter()
+                .map(|field| field.name.expect("a named variant's fields are named"));
+            quote!(#name::#variant_name { #(#names: #values),* })
+        }
+    }
+}
+
 /// The pattern matching one variant, binding every field it carries.
 fn pattern(name: &Ident, variant: &Case<'_>, prefix: &str) -> TokenStream {
-    let variant_name = variant.name;
-    if variant.fields.is_empty() {
-        quote!(#name::#variant_name)
-    } else {
-        let bindings = (0..variant.fields.len()).map(|index| binding(prefix, index));
-        quote!(#name::#variant_name(#(#bindings),*))
-    }
+    let bindings = (0..variant.fields.len())
+        .map(|index| binding(prefix, index))
+        .collect::<Vec<_>>();
+    construct(name, variant, &bindings)
 }
 
 // ============================================================
