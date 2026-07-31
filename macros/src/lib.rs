@@ -9,16 +9,18 @@ use proc_macro2::{Literal, TokenStream};
 use quote::{ToTokens, format_ident, quote};
 use syn::{
     Attribute, Data, DataEnum, DataStruct, DeriveInput, Error, Fields, FnArg, GenericArgument,
-    Generics, Ident, Item, ItemTrait, LitInt, Path, PathArguments, PathSegment, ReceiverKind,
-    ReturnType, Safety, Signature, TraitBound, TraitItem, TraitItemFn, Type, TypeImplTrait,
-    TypeParamBound, TypePath, Visibility, WherePredicate,
+    GenericParam, Generics, Ident, Item, ItemEnum, ItemTrait, LitInt, Path, PathArguments,
+    PathSegment, ReceiverKind, ReturnType, Safety, Signature, TraitBound, TraitItem, TraitItemFn,
+    Type, TypeImplTrait, TypeParamBound, TypePath, Visibility, WherePredicate, parse_quote,
 };
 
-/// Turns a trait into a zero-copy serialization schema.
+/// Turns a trait or an enum into a zero-copy serialization schema.
 ///
-/// Every method must declare the slot it occupies with `#[slot(N)]`. Slots are
-/// the identity of a field on the wire, so renaming or reordering methods is
-/// safe, and a reader skips slots it does not know about.
+/// # Traits
+///
+/// A trait is a message. Every method must declare the slot it occupies with
+/// `#[slot(N)]`. Slots are the identity of a field on the wire, so renaming or
+/// reordering methods is safe, and a reader skips slots it does not know about.
 ///
 /// The macro generates, alongside the trait:
 ///
@@ -30,63 +32,129 @@ use syn::{
 ///   the schema in `encode::<dyn Trait>()` and `decode::<dyn Trait>()`.
 ///
 /// Methods may return a scalar, `&str`, `&[u8]`, a value type named outright,
-/// a nested schema as `impl Trait + '_`, or a sequence of them as
-/// `impl List<Item = impl Trait + '_> + '_`. The last two return `impl Trait`,
-/// so they must be declared `where Self: Sized` to keep `dyn Trait` usable as
-/// the schema's name. A value type, being `Copy`, is instead returned as
-/// itself: see [`macro@Zerializable`].
+/// a schema declared as a trait as `impl Trait + '_`, a schema declared as an
+/// enum as `Enum<impl Trait + '_>`, or a sequence of either as
+/// `impl List<Item = ..> + '_`. Everything named as an `impl Trait` must be
+/// declared `where Self: Sized` to keep `dyn Trait` usable as the schema's
+/// name. A value type, being `Copy`, is instead returned as itself: see
+/// [`macro@Zerializable`].
+///
+/// # Enums
+///
+/// An enum is a choice between messages. Every variant must declare the tag
+/// that names it with `#[variant(N)]`, and every field of a variant the slot it
+/// occupies with `#[slot(N)]`. A field is either a scalar or one of the enum's
+/// parameters, each of which stands for a nested schema and so must be bound by
+/// the trait declaring it.
+///
+/// The macro generates, from the enum:
+///
+/// * the enum itself, with every parameter rewritten so that it may be either
+///   an implementation of the schema it carries or the name of that schema,
+/// * `impl Zerializable for Enum<dyn Trait, ..>`, which is how the enum over
+///   the names of the schemas it carries comes to name a schema itself,
+/// * `Debug`, and `PartialEq` between any two instantiations, so that a decoded
+///   enum compares against the value it was encoded from, and so that a message
+///   carrying an enum can print and compare the one it holds. Deriving either is
+///   rejected: a `derive` bounds the enum's parameters, which are not what its
+///   variants carry,
+/// * `as_ref`, which borrows what every variant carries, so that a message
+///   hands out an enum it stores the way it hands out `&self.nested`.
+///
+/// One declaration is therefore both a value and the name of a schema:
+/// `Worker<OwnedPerson>` holds a person, `Worker<dyn Person>` names the schema
+/// it encodes as, and decoding returns the enum over views,
+/// `Worker<PersonView<'_>>`, which is matched like any other enum. Because a
+/// variant's payload is written in terms of its parameter, a value has to be
+/// given a type where it is built:
+/// `let worker: Worker<OwnedPerson> = Worker::Engineer(person);`. For the same
+/// reason a `derive` other than the two above cannot see what an enum's
+/// payloads are: those implementations are written out, bounding the parameter
+/// by its schema trait, which is what resolves the payloads.
+///
+/// A message carries an enum by naming it the way its declaration reads,
+/// `fn role(&self) -> Worker<impl Person + '_> where Self: Sized`, so a schema
+/// is free to be a tree of messages and choices.
+///
+/// A variant's fields are its own, so two variants may use the same slots, and
+/// a field added to a variant is skipped by a reader built against the older
+/// schema. A variant added to the schema is not: a reader has nothing to decode
+/// an unknown tag as, and reports `Error::UnknownVariant`.
 #[proc_macro_attribute]
 pub fn zerializable(
     args: proc_macro::TokenStream,
     item: proc_macro::TokenStream,
 ) -> proc_macro::TokenStream {
-    let mut item = match parse_trait(item) {
+    let item = match syn::parse::<Item>(item) {
         Ok(item) => item,
         Err(error) => return error.to_compile_error().into(),
     };
-    let expansion = expand(args.into(), &item);
+    match item {
+        Item::Trait(item) => expand_trait(args.into(), item),
+        Item::Enum(item) => expand_enum(args.into(), item),
+        other => Error::new_spanned(
+            other,
+            "#[zerializable] may only be applied to a trait or an enum",
+        )
+        .to_compile_error(),
+    }
+    .into()
+}
+
+/// A trait is emitted as it was declared, with the generated code beside it.
+fn expand_trait(args: TokenStream, mut item: ItemTrait) -> TokenStream {
+    let expansion = no_arguments(args).and_then(|()| Ok(generate_schema(&parse_schema(&item)?)));
     // `#[slot(N)]` is consumed here, so it must be stripped from the trait even
     // when the rest of the expansion fails, or the reported error would be a
     // confusing "cannot find attribute `slot`".
-    strip_slot_attributes(&mut item);
+    for trait_item in &mut item.items {
+        match trait_item {
+            TraitItem::Const(item) => strip(&mut item.attrs),
+            TraitItem::Fn(item) => strip(&mut item.attrs),
+            TraitItem::Type(item) => strip(&mut item.attrs),
+            TraitItem::Macro(item) => strip(&mut item.attrs),
+            _ => continue,
+        }
+    }
     let mut output = item.into_token_stream();
-    output.extend(match expansion {
-        Ok(generated) => generated,
-        Err(error) => error.to_compile_error(),
-    });
-    output.into()
+    output.extend(expansion.unwrap_or_else(|error| error.to_compile_error()));
+    output
 }
 
-fn parse_trait(item: proc_macro::TokenStream) -> Result<ItemTrait, Error> {
-    match syn::parse(item)? {
-        Item::Trait(item) => Ok(item),
-        other => Err(Error::new_spanned(
-            other,
-            "#[zerializable] may only be applied to a trait",
-        )),
+/// An enum is rewritten rather than emitted as it was declared, so it is
+/// generated with the rest of the expansion. Only a failed expansion emits it
+/// as it was written, which keeps the reported error to the one that matters.
+fn expand_enum(args: TokenStream, mut item: ItemEnum) -> TokenStream {
+    let expansion =
+        no_arguments(args).and_then(|()| Ok(generate_choice(&item, &parse_choice(&item)?)));
+    match expansion {
+        Ok(generated) => generated,
+        Err(error) => {
+            strip_variant_attributes(&mut item);
+            let mut output = item.into_token_stream();
+            output.extend(error.to_compile_error());
+            output
+        }
     }
 }
 
-fn expand(args: TokenStream, item: &ItemTrait) -> Result<TokenStream, Error> {
-    if !args.is_empty() {
-        return Err(Error::new_spanned(
+fn no_arguments(args: TokenStream) -> Result<(), Error> {
+    if args.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::new_spanned(
             args,
             "#[zerializable] does not take any arguments",
-        ));
+        ))
     }
-    Ok(generate(&parse_schema(item)?))
 }
 
-fn strip_slot_attributes(item: &mut ItemTrait) {
-    for trait_item in &mut item.items {
-        let attributes = match trait_item {
-            TraitItem::Const(item) => &mut item.attrs,
-            TraitItem::Fn(item) => &mut item.attrs,
-            TraitItem::Type(item) => &mut item.attrs,
-            TraitItem::Macro(item) => &mut item.attrs,
-            _ => continue,
-        };
-        attributes.retain(|attribute| !attribute.path().is_ident("slot"));
+fn strip_variant_attributes(item: &mut ItemEnum) {
+    for variant in &mut item.variants {
+        strip(&mut variant.attrs);
+        for field in &mut variant.fields {
+            strip(&mut field.attrs);
+        }
     }
 }
 
@@ -117,14 +185,60 @@ pub fn derive_zerializable(item: proc_macro::TokenStream) -> proc_macro::TokenSt
     .into()
 }
 
+/// Removes the attributes the macro consumes, which are not attributes the
+/// compiler knows.
+fn strip(attributes: &mut Vec<Attribute>) {
+    attributes.retain(|attribute| {
+        !(attribute.path().is_ident("slot") || attribute.path().is_ident("variant"))
+    });
+}
+
 // ============================================================
 // Schema
 // ============================================================
 
+/// A schema declared as a trait: one message, with a field per method.
 struct Schema<'a> {
     visibility: &'a Visibility,
     name: &'a Ident,
     methods: Vec<Method<'a>>,
+}
+
+/// A schema declared as an enum: one of a set of variants, each carrying the
+/// fields declared for it.
+struct Choice<'a> {
+    visibility: &'a Visibility,
+    name: &'a Ident,
+    /// The parameters the enum carries nested schemas as, in declaration order.
+    params: Vec<Param<'a>>,
+    variants: Vec<Case<'a>>,
+}
+
+/// One parameter of an enum, standing for a schema its variants carry.
+#[derive(Clone, Copy)]
+struct Param<'a> {
+    name: &'a Ident,
+    /// The trait the parameter is bound by, which names the schema its values
+    /// are encoded as.
+    schema: &'a Path,
+}
+
+struct Case<'a> {
+    name: &'a Ident,
+    tag: u32,
+    fields: Vec<CaseField<'a>>,
+}
+
+struct CaseField<'a> {
+    slot: u32,
+    payload: Payload<'a>,
+}
+
+enum Payload<'a> {
+    /// A fixed width primitive, named by its Rust type.
+    Scalar(&'a Ident),
+    /// A nested message, carried by one of the enum's parameters.
+    Nested(Param<'a>),
 }
 
 struct Method<'a> {
@@ -143,29 +257,82 @@ enum Kind<'a> {
     Scalar(&'a Ident),
     /// A `Copy` type held by value, named by its path.
     Value(&'a Path),
-    /// A nested message, named by the path of its schema trait.
-    Nested(&'a Path),
-    /// A sequence of nested messages.
-    Repeated(&'a Path),
+    /// A nested schema.
+    Nested(Nested<'a>),
+    /// A sequence of nested schemas.
+    Repeated(Nested<'a>),
 }
 
-/// Names a schema by its trait, spelling out the `'static` object lifetime that
-/// `impl Zerializable for dyn Trait` is written against. Without it the default
-/// object lifetime in a return type is the one elided from `&self`.
-fn schema_of(path: &Path) -> TokenStream {
-    quote!((dyn #path + 'static))
+/// A schema one method returns, named the way the method returns it.
+#[derive(Clone, Copy)]
+enum Nested<'a> {
+    /// A message, returned as `impl Trait + '_` and named by that trait.
+    Message(&'a Path),
+    /// An enum, returned as the enum instantiated over the schemas it carries,
+    /// `Enum<impl Trait + '_>`.
+    Choice(&'a TypePath),
+}
+
+/// Names a nested schema as `Zerializable` implements it.
+fn schema_of(nested: Nested<'_>) -> TokenStream {
+    match nested {
+        // The `'static` object lifetime that `impl Zerializable for dyn Trait`
+        // is written against is spelled out, because the default object
+        // lifetime in a return type is the one elided from `&self`.
+        Nested::Message(path) => quote!((dyn #path + 'static)),
+        // An enum names a schema by carrying their names, so each of its
+        // arguments is the schema that argument returns.
+        Nested::Choice(path) => carried_schemas(path).into_token_stream(),
+    }
 }
 
 /// The view type of another schema, named through its `Zerializable` impl so
 /// that nested schemas do not have to live in the same module.
-fn view_of(path: &Path) -> TokenStream {
-    let schema = schema_of(path);
+fn view_of(nested: Nested<'_>) -> TokenStream {
+    let schema = schema_of(nested);
     quote!(<#schema as ::zerialize::Zerializable>::View<'buf>)
+}
+
+/// The enum with each schema it carries, written as `impl Trait + '_` where the
+/// method returns it, named as `Zerializable` implements it.
+fn carried_schemas(path: &TypePath) -> TypePath {
+    let mut path = path.clone();
+    let Some(segment) = path.path.segments.last_mut() else {
+        return path;
+    };
+    if let PathArguments::AngleBracketed(arguments) = &mut segment.arguments {
+        for argument in &mut arguments.args {
+            if let GenericArgument::Type(ty) = argument
+                && let Type::ImplTrait(carried) = ty
+                && let Ok(bound) = trait_bound(carried)
+            {
+                let schema = &bound.path;
+                *ty = parse_quote!((dyn #schema + 'static));
+            }
+        }
+    }
+    path
+}
+
+/// Whether an enum is returned carrying schemas, which is what makes the return
+/// type an `impl Trait` and so needs `where Self: Sized`.
+fn carries_schemas(path: &TypePath) -> bool {
+    path.path.segments.last().is_some_and(|segment| {
+        matches!(&segment.arguments, PathArguments::AngleBracketed(arguments)
+        if arguments.args.iter().any(|argument| {
+            matches!(argument, GenericArgument::Type(Type::ImplTrait(_)))
+        }))
+    })
 }
 
 const SCALARS: [&str; 11] = [
     "bool", "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64",
 ];
+
+/// What an enum's expansion implements, and so what deriving would collide
+/// with. Both are implementations a `derive` could not write: they are bounded
+/// by what the enum's payloads are, which only the schema knows.
+const GENERATED: [&str; 2] = ["Debug", "PartialEq"];
 
 // ============================================================
 // Parsing
@@ -366,8 +533,9 @@ fn parse_return_type(ty: &Type) -> Result<Kind<'_>, Error> {
     let unsupported = || {
         Error::new_spanned(
             ty,
-            "unsupported return type: expected a scalar, a value type, `&str`, `&[u8]`, \
-             `impl Trait + '_`, or `impl List<Item = impl Trait + '_> + '_`",
+            "unsupported return type: expected a scalar, a value type, `&str`, \
+             `&[u8]`, `impl Trait + '_`, `Enum<impl Trait + '_>`, or a list of \
+             either",
         )
     };
 
@@ -380,10 +548,14 @@ fn parse_return_type(ty: &Type) -> Result<Kind<'_>, Error> {
             },
             _ => Err(unsupported()),
         },
-        // Anything else named outright is a value: a `#[derive(Zerializable)]`
-        // type, which is returned as itself rather than as a view of the buffer.
+        // A path carrying schemas is one declared as an enum, returned as
+        // itself rather than as `impl Trait` because an enum is a type and not
+        // a trait. Anything else named outright is a value: a
+        // `#[derive(Zerializable)]` type, which is returned as itself rather
+        // than as a view of the buffer.
         Type::Path(path) if path.qself.is_none() => Ok(match scalar(path) {
             Some(scalar) => Kind::Scalar(scalar),
+            None if carries_schemas(path) => Kind::Nested(Nested::Choice(path)),
             None => Kind::Value(&path.path),
         }),
         Type::ImplTrait(impl_trait) => {
@@ -396,7 +568,7 @@ fn parse_return_type(ty: &Type) -> Result<Kind<'_>, Error> {
             if segment.ident == "List" {
                 Ok(Kind::Repeated(parse_list_item(segment)?))
             } else {
-                Ok(Kind::Nested(&bound.path))
+                Ok(Kind::Nested(Nested::Message(&bound.path)))
             }
         }
         _ => Err(unsupported()),
@@ -416,9 +588,9 @@ fn trait_bound(impl_trait: &TypeImplTrait) -> Result<&TraitBound, Error> {
     }
 }
 
-/// Extracts the element schema out of the `<Item = impl Path + '_>` that
-/// follows `impl List`.
-fn parse_list_item(list: &PathSegment) -> Result<&Path, Error> {
+/// Extracts the element schema out of the `<Item = ..>` that follows
+/// `impl List`, named there the way a method returning one element would.
+fn parse_list_item(list: &PathSegment) -> Result<Nested<'_>, Error> {
     let expected = || {
         Error::new_spanned(
             list,
@@ -437,17 +609,208 @@ fn parse_list_item(list: &PathSegment) -> Result<&Path, Error> {
             _ => None,
         })
         .ok_or_else(expected)?;
-    let Type::ImplTrait(item) = item else {
-        return Err(expected());
+    match item {
+        Type::ImplTrait(item) => Ok(Nested::Message(&trait_bound(item)?.path)),
+        // As in a return type, a path is a schema declared as an enum only
+        // where it carries the schemas it holds.
+        Type::Path(path) if carries_schemas(path) => Ok(Nested::Choice(path)),
+        _ => Err(expected()),
+    }
+}
+
+fn parse_choice(item: &ItemEnum) -> Result<Choice<'_>, Error> {
+    for attribute in &item.attrs {
+        if attribute.path().is_ident("derive") {
+            attribute.parse_nested_meta(|derived| match derived.path.get_ident() {
+                Some(derived) if GENERATED.iter().any(|name| derived == name) => {
+                    Err(Error::new_spanned(
+                        derived,
+                        format!("#[zerializable] implements {derived} for enums itself"),
+                    ))
+                }
+                _ => Ok(()),
+            })?;
+        }
+    }
+    if let Some(where_clause) = &item.generics.where_clause {
+        return Err(Error::new_spanned(
+            where_clause,
+            "#[zerializable] enums may not have a where clause",
+        ));
+    }
+
+    let mut params = Vec::new();
+    for param in &item.generics.params {
+        params.push(parse_param(param)?);
+    }
+
+    let mut variants = Vec::new();
+    for variant in &item.variants {
+        variants.push(parse_case(variant, &params, &variants)?);
+    }
+    if variants.is_empty() {
+        return Err(Error::new_spanned(
+            item,
+            "#[zerializable] enums must have at least one variant",
+        ));
+    }
+
+    // A parameter no variant carries would leave the generated enum with a
+    // parameter it does not use, which is not a legal enum.
+    for param in &params {
+        let carried = variants
+            .iter()
+            .flat_map(|variant| &variant.fields)
+            .any(|field| matches!(field.payload, Payload::Nested(by) if by.name == param.name));
+        if !carried {
+            return Err(Error::new_spanned(
+                param.name,
+                format!("no field carries `{}`", param.name),
+            ));
+        }
+    }
+
+    Ok(Choice {
+        visibility: &item.vis,
+        name: &item.ident,
+        params,
+        variants,
+    })
+}
+
+/// Parses one parameter of an enum, which stands for a schema and so must name
+/// the trait declaring it.
+fn parse_param(param: &GenericParam) -> Result<Param<'_>, Error> {
+    let GenericParam::Type(param) = param else {
+        return Err(Error::new_spanned(
+            param,
+            "#[zerializable] enums may only be generic over the schemas they carry",
+        ));
     };
-    Ok(&trait_bound(item)?.path)
+    if let Some((_, default)) = &param.default {
+        return Err(Error::new_spanned(
+            default,
+            "#[zerializable] parameters may not have a default",
+        ));
+    }
+    let mut bounds = param.bounds.iter();
+    let schema = match (bounds.next(), bounds.next()) {
+        (Some(TypeParamBound::Trait(bound)), None) if bound.maybe.is_none() => &bound.path,
+        _ => {
+            return Err(Error::new_spanned(
+                param,
+                "every #[zerializable] parameter must be bound by exactly one trait, \
+                 naming the schema it carries",
+            ));
+        }
+    };
+    Ok(Param {
+        name: &param.ident,
+        schema,
+    })
+}
+
+/// Parses one variant, given the variants of the same enum already parsed,
+/// which is what a tag is checked for uniqueness against.
+fn parse_case<'a>(
+    variant: &'a syn::Variant,
+    params: &[Param<'a>],
+    parsed: &[Case<'a>],
+) -> Result<Case<'a>, Error> {
+    if let Some((_, discriminant)) = &variant.discriminant {
+        return Err(Error::new_spanned(
+            discriminant,
+            "#[zerializable] variants may not have a discriminant: \
+             what names a variant on the wire is its #[variant(N)]",
+        ));
+    }
+
+    let mut fields = Vec::new();
+    match &variant.fields {
+        Fields::Unit => {}
+        Fields::Unnamed(unnamed) => {
+            for field in &unnamed.unnamed {
+                fields.push(parse_case_field(field, params, &fields)?);
+            }
+        }
+        Fields::Named(named) => {
+            return Err(Error::new_spanned(
+                named,
+                "#[zerializable] variants must be unit or tuple variants",
+            ));
+        }
+    }
+
+    let Some((tag, attribute)) = declared_number(&variant.attrs, "variant")? else {
+        return Err(Error::new_spanned(
+            variant,
+            "every #[zerializable] variant requires a #[variant(N)] attribute",
+        ));
+    };
+    if let Some(previous) = parsed.iter().find(|variant| variant.tag == tag) {
+        return Err(Error::new_spanned(
+            attribute,
+            format!("variant {tag} is already used by `{}`", previous.name),
+        ));
+    }
+
+    Ok(Case {
+        name: &variant.ident,
+        tag,
+        fields,
+    })
+}
+
+fn parse_case_field<'a>(
+    field: &'a syn::Field,
+    params: &[Param<'a>],
+    parsed: &[CaseField<'a>],
+) -> Result<CaseField<'a>, Error> {
+    let payload = parse_payload(&field.ty, params)?;
+
+    let Some((slot, attribute)) = declared_number(&field.attrs, "slot")? else {
+        return Err(Error::new_spanned(
+            field,
+            "every field of a #[zerializable] variant requires a #[slot(N)] attribute",
+        ));
+    };
+    if let Some(previous) = parsed.iter().position(|field| field.slot == slot) {
+        return Err(Error::new_spanned(
+            attribute,
+            format!("slot {slot} is already used by field {previous}"),
+        ));
+    }
+
+    Ok(CaseField { slot, payload })
+}
+
+fn parse_payload<'a>(ty: &'a Type, params: &[Param<'a>]) -> Result<Payload<'a>, Error> {
+    let unsupported = || {
+        Error::new_spanned(
+            ty,
+            "unsupported field type: expected a scalar, or a parameter naming \
+             the schema the field carries",
+        )
+    };
+
+    let Type::Path(path) = ty else {
+        return Err(unsupported());
+    };
+    let name = named(path).ok_or_else(unsupported)?;
+    if let Some(param) = params.iter().find(|param| param.name == name) {
+        Ok(Payload::Nested(*param))
+    } else if SCALARS.iter().any(|scalar| name == scalar) {
+        Ok(Payload::Scalar(name))
+    } else {
+        Err(unsupported())
+    }
 }
 
 // ============================================================
 // Code generation
 // ============================================================
 
-fn generate(schema: &Schema<'_>) -> TokenStream {
+fn generate_schema(schema: &Schema<'_>) -> TokenStream {
     const VALIDATED: &str = "the message was validated when it was decoded";
     let Schema {
         visibility,
@@ -481,15 +844,15 @@ fn generate(schema: &Schema<'_>) -> TokenStream {
             Kind::Value(path) => quote! {
                 <#path as ::zerialize::Value>::encode_value(&#value, __writer);
             },
-            Kind::Nested(path) => {
-                let schema = schema_of(path);
+            Kind::Nested(nested) => {
+                let schema = schema_of(*nested);
                 quote! {
                     let __value = #value;
                     <#schema as ::zerialize::Zerializable>::encode_source(&__value, __writer);
                 }
             }
-            Kind::Repeated(path) => {
-                let schema = schema_of(path);
+            Kind::Repeated(nested) => {
+                let schema = schema_of(*nested);
                 quote! {
                     let __items = #value;
                     let __length = ::zerialize::List::len(&__items);
@@ -549,10 +912,10 @@ fn generate(schema: &Schema<'_>) -> TokenStream {
                         .expect(#VALIDATED)
                 },
             ),
-            Kind::Nested(path) => {
-                let schema = schema_of(path);
+            Kind::Nested(nested) => {
+                let schema = schema_of(*nested);
                 (
-                    view_of(path),
+                    view_of(*nested),
                     quote! {
                         <#schema as ::zerialize::Zerializable>::decode_view(
                             __message.read_message(#slot).expect(#VALIDATED),
@@ -561,8 +924,8 @@ fn generate(schema: &Schema<'_>) -> TokenStream {
                     },
                 )
             }
-            Kind::Repeated(path) => {
-                let schema = schema_of(path);
+            Kind::Repeated(nested) => {
+                let schema = schema_of(*nested);
                 (
                     quote!(::zerialize::ListView<'buf, #schema>),
                     quote!(__message.read_list(#slot).expect(#VALIDATED)),
@@ -639,16 +1002,16 @@ fn generate(schema: &Schema<'_>) -> TokenStream {
             Kind::Value(path) => {
                 quote!(<#path as ::zerialize::Value>::decode_value(__message, #slot)?;)
             }
-            Kind::Nested(path) => {
-                let schema = schema_of(path);
+            Kind::Nested(nested) => {
+                let schema = schema_of(*nested);
                 quote! {
                     <#schema as ::zerialize::Zerializable>::decode_view(
                         __message.read_message(#slot)?,
                     )?;
                 }
             }
-            Kind::Repeated(path) => {
-                let schema = schema_of(path);
+            Kind::Repeated(nested) => {
+                let schema = schema_of(*nested);
                 quote!(__message.read_list::<#schema>(#slot)?;)
             }
         }
@@ -745,7 +1108,366 @@ fn generate(schema: &Schema<'_>) -> TokenStream {
                 ::core::result::Result::Ok(#view { bytes: __message.bytes() })
             }
         }
+
+        // So that an enum may carry this schema: an enum over the name of a
+        // schema carries nothing, since it is a name rather than a value.
+        impl ::zerialize::SchemaArg for dyn #name {
+            type Value = ::zerialize::SchemaOnly;
+        }
     }
+}
+
+/// The enum instantiated over `arguments`, which is the enum itself when it
+/// carries no schemas.
+fn instantiate<T: ToTokens>(name: &Ident, arguments: &[T]) -> TokenStream {
+    if arguments.is_empty() {
+        quote!(#name)
+    } else {
+        quote!(#name<#(#arguments),*>)
+    }
+}
+
+fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>) -> TokenStream {
+    let Choice {
+        visibility,
+        name,
+        params,
+        variants,
+    } = parsed;
+    let source = format_ident!("__{}Source", name);
+    let declaration = declaration(item, params);
+
+    // The enum is instantiated three ways: over implementations of the schemas
+    // it carries, which is what an encodable value is; over the names of those
+    // schemas, which is the name of this one; and over their views, which is
+    // what decoding it returns.
+    let bounds = params
+        .iter()
+        .map(|param| {
+            let (name, schema) = (param.name, param.schema);
+            quote!(#name: #schema)
+        })
+        .collect::<Vec<_>>();
+    let generics = if bounds.is_empty() {
+        TokenStream::new()
+    } else {
+        quote!(<#(#bounds),*>)
+    };
+    let parameters = params.iter().map(|param| param.name).collect::<Vec<_>>();
+    let encodable = instantiate(name, &parameters);
+
+    let schemas = params
+        .iter()
+        .map(|param| schema_of(Nested::Message(param.schema)))
+        .collect::<Vec<_>>();
+    let schema = instantiate(name, &schemas);
+    let views = params
+        .iter()
+        .map(|param| view_of(Nested::Message(param.schema)))
+        .collect::<Vec<_>>();
+    let view = instantiate(name, &views);
+
+    let encoded = variants.iter().map(|variant| {
+        let tag = Literal::u32_suffixed(variant.tag);
+        let pattern = pattern(name, variant, "__field");
+        let payload = if variant.fields.is_empty() {
+            TokenStream::new()
+        } else {
+            // The payload's table is indexed by slot, so it is as long as the
+            // highest one the variant declares.
+            let slots = Literal::usize_suffixed(
+                variant
+                    .fields
+                    .iter()
+                    .map(|field| field.slot as usize + 1)
+                    .max()
+                    .expect("the variant has fields"),
+            );
+            let written = variant.fields.iter().enumerate().map(|(index, field)| {
+                let entry = Literal::usize_suffixed(field.slot as usize);
+                let binding = binding("__field", index);
+                let write = match &field.payload {
+                    Payload::Scalar(scalar) => {
+                        let write = format_ident!("write_{}", scalar);
+                        quote!(__writer.#write(*#binding);)
+                    }
+                    Payload::Nested(carried) => {
+                        let schema = schema_of(Nested::Message(carried.schema));
+                        quote! {
+                            <#schema as ::zerialize::Zerializable>::encode_source(
+                                #binding,
+                                __writer,
+                            );
+                        }
+                    }
+                };
+                quote! {
+                    __writer.begin_entry(&__payload, #entry);
+                    #write
+                }
+            });
+            quote! {
+                let __payload = __writer.begin_payload(&__frame, #slots);
+                #(#written)*
+                __writer.end_frame(__payload);
+            }
+        };
+        quote! {
+            #pattern => {
+                let __frame = __writer.begin_variant(#tag);
+                #payload
+                __writer.end_frame(__frame);
+            }
+        }
+    });
+
+    let decoded = variants.iter().map(|variant| {
+        let tag = Literal::u32_suffixed(variant.tag);
+        let variant_name = variant.name;
+        if variant.fields.is_empty() {
+            return quote!(#tag => ::core::result::Result::Ok(#name::#variant_name),);
+        }
+        let read = variant.fields.iter().map(|field| {
+            let slot = Literal::u32_suffixed(field.slot);
+            match &field.payload {
+                Payload::Scalar(scalar) => {
+                    let read = format_ident!("read_{}", scalar);
+                    quote!(__payload.#read(#slot)?)
+                }
+                Payload::Nested(carried) => {
+                    let schema = schema_of(Nested::Message(carried.schema));
+                    quote! {
+                        <#schema as ::zerialize::Zerializable>::decode_view(
+                            __payload.read_message(#slot)?,
+                        )?
+                    }
+                }
+            }
+        });
+        quote! {
+            #tag => {
+                let __payload = __message.read_payload()?;
+                ::core::result::Result::Ok(#name::#variant_name(#(#read),*))
+            }
+        }
+    });
+
+    // Debug and a comparison across instantiations are what a message carrying
+    // an enum needs of it: a view prints and compares every field it holds, and
+    // the enum a view holds is the enum over views, while the one it is compared
+    // against is the enum over some other implementation. A `derive` provides
+    // neither, since it cannot see through the payloads.
+    let debug_generics = parameters_bounded_by(params, quote!(::core::fmt::Debug));
+    let printed = variants.iter().map(|variant| {
+        let pattern = pattern(name, variant, "__field");
+        let label = variant.name.to_string();
+        let fields = (0..variant.fields.len()).map(|index| {
+            let binding = binding("__field", index);
+            quote!(.field(#binding))
+        });
+        quote! {
+            #pattern => __formatter.debug_tuple(#label)#(#fields)*.finish(),
+        }
+    });
+
+    let others = params
+        .iter()
+        .map(|param| format_ident!("__Other{}", param.name))
+        .collect::<Vec<_>>();
+    let compared_generics = if params.is_empty() {
+        TokenStream::new()
+    } else {
+        let bounds = params.iter().zip(&others).map(|(param, other)| {
+            let (name, schema) = (param.name, param.schema);
+            quote!(#name: #schema + ::core::cmp::PartialEq<#other>, #other: #schema)
+        });
+        quote!(<#(#bounds),*>)
+    };
+    let compared_to = instantiate(name, &others);
+
+    // The enum over references to what it carries. A message hands out an enum
+    // by value, since the enum a view holds is decided when it is read rather
+    // than stored anywhere to be pointed at, so this is how an implementation
+    // hands out one of its own without copying what it carries.
+    let borrowed_to = instantiate(
+        name,
+        &params
+            .iter()
+            .map(|param| {
+                let name = param.name;
+                quote!(&#name)
+            })
+            .collect::<Vec<_>>(),
+    );
+    let borrowed = variants.iter().map(|variant| {
+        let pattern = pattern(name, variant, "__field");
+        let variant_name = variant.name;
+        let fields = variant.fields.iter().enumerate().map(|(index, field)| {
+            let binding = binding("__field", index);
+            match &field.payload {
+                // A scalar is carried by value, so a reference to one is not
+                // what the borrowed enum holds.
+                Payload::Scalar(_) => quote!(*#binding),
+                Payload::Nested(_) => quote!(#binding),
+            }
+        });
+        if variant.fields.is_empty() {
+            quote!(#pattern => #name::#variant_name,)
+        } else {
+            quote!(#pattern => #name::#variant_name(#(#fields),*),)
+        }
+    });
+    let borrowing = format!(
+        "Borrows what every variant carries, so that a `{name}` an \
+         implementation stores can be handed out as the one it encodes as."
+    );
+    let compared = variants.iter().map(|variant| {
+        let mine = pattern(name, variant, "__field");
+        let theirs = pattern(name, variant, "__other");
+        let equal = (0..variant.fields.len()).map(|index| {
+            let (mine, theirs) = (binding("__field", index), binding("__other", index));
+            quote!(#mine == #theirs)
+        });
+        quote! {
+            (#mine, #theirs) => true #(&& #equal)*,
+        }
+    });
+    // A single variant leaves nothing for a catch all arm to match.
+    let unequal = if variants.len() > 1 {
+        quote!(_ => false,)
+    } else {
+        TokenStream::new()
+    };
+
+    quote! {
+        #declaration
+
+        #[allow(dead_code)]
+        impl #generics #encodable {
+            #[doc = #borrowing]
+            #visibility fn as_ref(&self) -> #borrowed_to {
+                match self {
+                    #(#borrowed)*
+                }
+            }
+        }
+
+        impl #debug_generics ::core::fmt::Debug for #encodable {
+            fn fmt(
+                &self,
+                __formatter: &mut ::core::fmt::Formatter<'_>,
+            ) -> ::core::fmt::Result {
+                match self {
+                    #(#printed)*
+                }
+            }
+        }
+
+        impl #compared_generics ::core::cmp::PartialEq<#compared_to> for #encodable {
+            fn eq(&self, __other: &#compared_to) -> bool {
+                match (self, __other) {
+                    #(#compared)*
+                    #unequal
+                }
+            }
+        }
+
+        // The object safe adapter that gives `encode::<Enum<dyn Trait>>(&value)`
+        // one dynamic call to dispatch on, whatever the enum is instantiated
+        // over.
+        #[doc(hidden)]
+        #visibility trait #source {
+            fn __zerialize_encode(&self, __writer: &mut ::zerialize::Writer);
+        }
+
+        impl #generics #source for #encodable {
+            fn __zerialize_encode(&self, __writer: &mut ::zerialize::Writer) {
+                match self {
+                    #(#encoded)*
+                }
+            }
+        }
+
+        impl ::zerialize::Zerializable for #schema {
+            type Source<'src> = dyn #source + 'src;
+            type View<'buf> = #view;
+
+            fn encode_source<'src>(
+                __source: &'src Self::Source<'src>,
+                __writer: &mut ::zerialize::Writer,
+            ) {
+                #source::__zerialize_encode(__source, __writer)
+            }
+
+            // Unlike a message, whose view is the bytes it was decoded from,
+            // the variant a value holds is decided here: the tag names it, and
+            // reading the fields it carries is what validates them.
+            fn decode_view<'buf>(
+                __message: ::zerialize::Message<'buf>,
+            ) -> ::core::result::Result<Self::View<'buf>, ::zerialize::Error> {
+                match __message.read_tag()? {
+                    #(#decoded)*
+                    _ => ::core::result::Result::Err(::zerialize::Error::UnknownVariant),
+                }
+            }
+        }
+    }
+}
+
+/// The enum as it was declared, with every parameter rewritten to stand for
+/// what its variants carry: an implementation stands for itself, and the name
+/// of a schema for nothing that can be constructed.
+fn declaration(item: &ItemEnum, params: &[Param<'_>]) -> TokenStream {
+    let mut item = item.clone();
+    strip_variant_attributes(&mut item);
+    for param in &mut item.generics.params {
+        if let GenericParam::Type(param) = param {
+            param.bounds.push(parse_quote!(::zerialize::SchemaArg));
+            param.bounds.push(parse_quote!(?Sized));
+        }
+    }
+    for variant in &mut item.variants {
+        for field in &mut variant.fields {
+            let carried = params
+                .iter()
+                .find(|param| matches!(&field.ty, Type::Path(path) if named(path) == Some(param.name)))
+                .map(|param| param.name);
+            if let Some(carried) = carried {
+                field.ty = parse_quote!(<#carried as ::zerialize::SchemaArg>::Value);
+            }
+        }
+    }
+    item.into_token_stream()
+}
+
+/// What a field is bound to when its variant is matched, since the fields of a
+/// tuple variant have no names of their own.
+fn binding(prefix: &str, index: usize) -> Ident {
+    format_ident!("{}{}", prefix, index)
+}
+
+/// The pattern matching one variant, binding every field it carries.
+fn pattern(name: &Ident, variant: &Case<'_>, prefix: &str) -> TokenStream {
+    let variant_name = variant.name;
+    if variant.fields.is_empty() {
+        quote!(#name::#variant_name)
+    } else {
+        let bindings = (0..variant.fields.len()).map(|index| binding(prefix, index));
+        quote!(#name::#variant_name(#(#bindings),*))
+    }
+}
+
+/// The enum's parameters, each bounded by the schema it carries and by `also`,
+/// as the generics of an implementation.
+fn parameters_bounded_by(params: &[Param<'_>], also: TokenStream) -> TokenStream {
+    if params.is_empty() {
+        return TokenStream::new();
+    }
+    let bounds = params.iter().map(|param| {
+        let (name, schema) = (param.name, param.schema);
+        quote!(#name: #schema + #also)
+    });
+    quote!(<#(#bounds),*>)
 }
 
 // ============================================================
