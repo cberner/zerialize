@@ -1,6 +1,6 @@
 //! Sequences of messages.
 
-use crate::wire::{Frame, Message};
+use crate::wire::{Message, Vector};
 use crate::{Error, Zerializable};
 use std::fmt::{self, Debug};
 use std::marker::PhantomData;
@@ -118,11 +118,11 @@ impl<'a, T> List for &'a OwnedList<T> {
 
 /// A list of encoded messages, each decoded when it is asked for.
 ///
-/// This is the bytes of one frame and nothing else, so it costs the same as a
-/// slice however many elements it covers, and reaching any one of them is an
-/// index into that frame's offset table.
+/// This is one vector's position in the buffer and nothing else, so it costs
+/// the same however many elements it covers, and reaching any one of them is an
+/// index into the offsets that vector is made of.
 pub struct ListView<'buf, S: ?Sized> {
-    frame: Frame<'buf>,
+    vector: Vector<'buf>,
     schema: PhantomData<fn() -> *const S>,
 }
 
@@ -135,17 +135,10 @@ impl<S: ?Sized> Clone for ListView<'_, S> {
 impl<S: ?Sized> Copy for ListView<'_, S> {}
 
 impl<'buf, S: ?Sized> ListView<'buf, S> {
-    pub(crate) fn new(frame: Frame<'buf>) -> Self {
+    pub(crate) fn new(vector: Vector<'buf>) -> Self {
         Self {
-            frame,
+            vector,
             schema: PhantomData,
-        }
-    }
-
-    fn element(&self, index: usize) -> Result<Option<Frame<'buf>>, Error> {
-        match self.frame.entry(index)? {
-            Some(bytes) => Ok(Some(Frame::read(bytes)?)),
-            None => Ok(None),
         }
     }
 }
@@ -154,15 +147,16 @@ impl<'buf, S: Zerializable + ?Sized> List for ListView<'buf, S> {
     type Item = S::View<'buf>;
 
     fn len(&self) -> usize {
-        self.frame.count()
+        self.vector.len()
     }
 
     fn get(&self, index: usize) -> Option<S::View<'buf>> {
         let element = self
+            .vector
             .element(index)
             .expect("elements are validated when the message is decoded")?;
         Some(
-            S::decode_view(Message::element(element, 0, false))
+            S::decode_view(Message::element(self.vector.buf(), element, 0, false))
                 .expect("elements are validated when the message is decoded"),
         )
     }
@@ -170,10 +164,10 @@ impl<'buf, S: Zerializable + ?Sized> List for ListView<'buf, S> {
 
 impl<'buf, S: Zerializable + ?Sized> ListView<'buf, S> {
     /// Decodes every element, so that [`List::get`] cannot fail afterwards.
-    pub(crate) fn validate(&self, depth: u32) -> Result<(), Error> {
+    pub(crate) fn validate(&self, depth: u16) -> Result<(), Error> {
         for index in 0..self.len() {
-            let element = self.element(index)?.ok_or(Error::MissingField)?;
-            S::decode_view(Message::element(element, depth, true))?;
+            let element = self.vector.element(index)?.ok_or(Error::MissingField)?;
+            S::decode_view(Message::element(self.vector.buf(), element, depth, true))?;
         }
         Ok(())
     }

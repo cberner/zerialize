@@ -9,6 +9,10 @@
 Zerialize provides zero-cost deserialization and a natural interface that allows code to be written
 against the traits, structs, and enums in the codebase, without referencing any generated types.
 
+The wire format is [FlatBuffers](https://flatbuffers.dev), so what it writes is readable by any
+FlatBuffers implementation, and a schema written here is one that could equally have been written
+in a `.fbs` file. Buffers are size prefixed.
+
 
 ## License
 

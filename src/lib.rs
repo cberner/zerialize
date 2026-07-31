@@ -196,6 +196,18 @@
 //! A message carries an enum by naming it the way its declaration reads, as
 //! `fn shape(&self) -> Shape<impl Point + '_> where Self: Sized`, so a schema is
 //! free to be a tree of messages and choices.
+//!
+//! # Wire format
+//!
+//! The format is [FlatBuffers]: a message is a table, a slot is the field id it
+//! is addressed by, and a list is a vector of tables. A schema declared here is
+//! therefore one that could equally have been declared in a `.fbs` file, and
+//! what [`encode`] produces is readable by any FlatBuffers implementation
+//! without going through this crate at all. Buffers are size prefixed, so a
+//! reader must expect the prefix: `flatbuffers::size_prefixed_root` rather than
+//! `flatbuffers::root`.
+//!
+//! [FlatBuffers]: https://flatbuffers.dev
 
 #![forbid(unsafe_code)]
 
@@ -203,7 +215,7 @@ mod list;
 mod wire;
 
 pub use list::{List, ListIter, ListView, OwnedList};
-pub use wire::{FrameMark, Message, Writer};
+pub use wire::{Message, MessageMark, Offset, Writer};
 pub use zerialize_macros::{Zerializable, zerializable};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -229,8 +241,13 @@ pub trait Zerializable {
     /// The zero-copy view returned by decoding.
     type View<'buf>: 'buf;
 
+    /// Writes `source` into `writer`, returning where it was written.
+    ///
+    /// A message is written after everything it refers to, so encoding hands
+    /// back the offset naming it rather than leaving it wherever the writer
+    /// happened to be.
     #[doc(hidden)]
-    fn encode_source<'src>(source: &'src Self::Source<'src>, writer: &mut Writer);
+    fn encode_source<'src>(source: &'src Self::Source<'src>, writer: &mut Writer) -> Offset;
 
     #[doc(hidden)]
     fn decode_view<'buf>(message: Message<'buf>) -> Result<Self::View<'buf>, Error>;
@@ -247,14 +264,24 @@ pub trait Zerializable {
 ///
 /// Implemented by `#[derive(Zerializable)]` on a `Copy` struct or enum.
 pub trait Value: Copy {
+    /// Writes whatever the value needs written before the message holding it is
+    /// begun, which is nothing at all for a value that lives in that message.
+    ///
+    /// A value chooses its own shape on the wire: a value enum is a scalar,
+    /// written where the message holding it has left room, and a value struct a
+    /// message of its own, written beside it.
     #[doc(hidden)]
-    fn encode_value(&self, writer: &mut Writer);
+    fn prepare_value(&self, writer: &mut Writer) -> Option<Offset>;
+
+    /// Writes the value into `slot` of the message being built, given whatever
+    /// [`Value::prepare_value`] wrote for it.
+    #[doc(hidden)]
+    fn write_value(&self, writer: &mut Writer, slot: u32, prepared: Option<Offset>);
 
     /// Decodes the value held by `slot` of `message`.
     ///
-    /// A value is addressed by its slot rather than handed its bytes because it
-    /// chooses its own shape on the wire: a value enum is a scalar, a value
-    /// struct a message of its own.
+    /// A value is addressed by its slot rather than handed its bytes because of
+    /// the same choice: what a slot holds is up to the value that claims it.
     #[doc(hidden)]
     fn decode_value(message: Message<'_>, slot: u32) -> Result<Self, Error>;
 }
@@ -267,8 +294,8 @@ where
     S: Zerializable + ?Sized,
 {
     let mut writer = Writer::new();
-    <S as Zerializable>::encode_source(source, &mut writer);
-    writer.finish()
+    let root = <S as Zerializable>::encode_source(source, &mut writer);
+    writer.finish(root)
 }
 
 /// Decodes a view of `bytes` as the schema `S`.

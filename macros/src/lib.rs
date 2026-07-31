@@ -967,57 +967,74 @@ fn generate_schema(schema: &Schema<'_>, derived: Derived) -> TokenStream {
     } = schema;
     let view = format_ident!("{}View", name);
     let source = format_ident!("__{}Source", name);
-    // The offset table is indexed by slot, so it is as long as the highest one.
-    let slots = Literal::usize_suffixed(
-        methods
-            .iter()
-            .map(|method| method.slot as usize + 1)
-            .max()
-            .unwrap_or(0),
-    );
 
-    let encoded = methods.iter().map(|method| {
-        let entry = Literal::usize_suffixed(method.slot as usize);
-        let value = {
+    // A message is written after everything it refers to, so encoding a field
+    // is in two parts: what the field refers to is written here, before the
+    // message is begun, and the slot naming it is filled in below.
+    let prepared = methods.iter().map(|method| {
+        let (value, prepared) = (
+            binding("__value", method.slot as usize),
+            binding("__at", method.slot as usize),
+        );
+        let read = {
             let method = method.name;
             quote!(<Self as #name>::#method(self))
         };
-        let write = match &method.kind {
-            Kind::Str => quote!(__writer.write_str(#value);),
-            Kind::Bytes => quote!(__writer.write_bytes(#value);),
-            Kind::Scalar(scalar) => {
-                let write = format_ident!("write_{}", scalar);
-                quote!(__writer.#write(#value);)
-            }
+        match &method.kind {
+            Kind::Str => quote!(let #prepared = __writer.write_str(#read);),
+            Kind::Bytes => quote!(let #prepared = __writer.write_bytes(#read);),
+            Kind::Scalar(_) => quote!(let #value = #read;),
             Kind::Value(path) => quote! {
-                <#path as ::zerialize::Value>::encode_value(&#value, __writer);
+                let #value = #read;
+                let #prepared = <#path as ::zerialize::Value>::prepare_value(&#value, __writer);
             },
             Kind::Nested(nested) => {
                 let schema = schema_of(*nested);
                 quote! {
-                    let __value = #value;
-                    <#schema as ::zerialize::Zerializable>::encode_source(&__value, __writer);
+                    let #value = #read;
+                    let #prepared =
+                        <#schema as ::zerialize::Zerializable>::encode_source(&#value, __writer);
                 }
             }
             Kind::Repeated(nested) => {
                 let schema = schema_of(*nested);
                 quote! {
-                    let __items = #value;
-                    let __length = ::zerialize::List::len(&__items);
-                    let __list = __writer.begin_frame(__length);
+                    let #value = #read;
+                    let __length = ::zerialize::List::len(&#value);
+                    let mut __elements = ::std::vec::Vec::with_capacity(__length);
                     for __index in 0..__length {
-                        let __item = ::zerialize::List::get(&__items, __index)
+                        let __item = ::zerialize::List::get(&#value, __index)
                             .expect("List::get returned None below List::len");
-                        __writer.begin_entry(&__list, __index);
-                        <#schema as ::zerialize::Zerializable>::encode_source(&__item, __writer);
+                        __elements.push(
+                            <#schema as ::zerialize::Zerializable>::encode_source(
+                                &__item,
+                                __writer,
+                            ),
+                        );
                     }
-                    __writer.end_frame(__list);
+                    let #prepared = __writer.write_list(&__elements);
                 }
             }
-        };
-        quote! {
-            __writer.begin_entry(&__frame, #entry);
-            #write
+        }
+    });
+
+    let slotted = methods.iter().map(|method| {
+        let slot = Literal::u32_suffixed(method.slot);
+        let (value, prepared) = (
+            binding("__value", method.slot as usize),
+            binding("__at", method.slot as usize),
+        );
+        match &method.kind {
+            Kind::Str | Kind::Bytes | Kind::Nested(_) | Kind::Repeated(_) => {
+                quote!(__writer.set_offset(#slot, #prepared);)
+            }
+            Kind::Scalar(scalar) => {
+                let set = format_ident!("set_{}", scalar);
+                quote!(__writer.#set(#slot, #value);)
+            }
+            Kind::Value(path) => quote! {
+                <#path as ::zerialize::Value>::write_value(&#value, __writer, #slot, #prepared);
+            },
         }
     });
 
@@ -1083,7 +1100,7 @@ fn generate_schema(schema: &Schema<'_>, derived: Derived) -> TokenStream {
         let method = method.name;
         quote! {
             #visibility fn #method(&self) -> #return_type {
-                let __message = ::zerialize::Message::trusted(self.bytes);
+                let __message = self.message;
                 #body
             }
         }
@@ -1214,14 +1231,19 @@ fn generate_schema(schema: &Schema<'_>, derived: Derived) -> TokenStream {
         // single dynamic call to dispatch on, rather than one per field.
         #[doc(hidden)]
         #visibility trait #source {
-            fn __zerialize_encode(&self, __writer: &mut ::zerialize::Writer);
+            fn __zerialize_encode(&self, __writer: &mut ::zerialize::Writer)
+                -> ::zerialize::Offset;
         }
 
         impl<__S: #name> #source for __S {
-            fn __zerialize_encode(&self, __writer: &mut ::zerialize::Writer) {
-                let __frame = __writer.begin_frame(#slots);
-                #(#encoded)*
-                __writer.end_frame(__frame);
+            fn __zerialize_encode(
+                &self,
+                __writer: &mut ::zerialize::Writer,
+            ) -> ::zerialize::Offset {
+                #(#prepared)*
+                let __message = __writer.begin_message();
+                #(#slotted)*
+                __writer.end_message(__message)
             }
         }
 
@@ -1229,14 +1251,15 @@ fn generate_schema(schema: &Schema<'_>, derived: Derived) -> TokenStream {
             #(#forwarded)*
         }
 
-        // The view is the bytes of the message and nothing else. Fields are
-        // read out of them on access, by indexing the frame's offset table with
-        // the slot number, so a view costs the same whatever its schema holds.
+        // The view is where the message is in the buffer and nothing else.
+        // Fields are read out of it on access, by looking the slot number up in
+        // the message's vtable, so a view costs the same whatever its schema
+        // holds.
         #[doc = #documentation]
         #[derive(::core::clone::Clone, ::core::marker::Copy)]
         #[allow(dead_code)]
         #visibility struct #view<'buf> {
-            bytes: &'buf [u8],
+            message: ::zerialize::Message<'buf>,
         }
 
         #[allow(dead_code)]
@@ -1258,7 +1281,7 @@ fn generate_schema(schema: &Schema<'_>, derived: Derived) -> TokenStream {
             fn encode_source<'src>(
                 __source: &'src Self::Source<'src>,
                 __writer: &mut ::zerialize::Writer,
-            ) {
+            ) -> ::zerialize::Offset {
                 #source::__zerialize_encode(__source, __writer)
             }
 
@@ -1266,7 +1289,7 @@ fn generate_schema(schema: &Schema<'_>, derived: Derived) -> TokenStream {
                 __message: ::zerialize::Message<'buf>,
             ) -> ::core::result::Result<Self::View<'buf>, ::zerialize::Error> {
                 #validate
-                ::core::result::Result::Ok(#view { bytes: __message.bytes() })
+                ::core::result::Result::Ok(#view { message: __message.trusted() })
             }
         }
 
@@ -1328,59 +1351,7 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
         .collect::<Vec<_>>();
     let view = instantiate(name, &views);
 
-    let encoded = variants.iter().map(|variant| {
-        let tag = Literal::u32_suffixed(variant.tag);
-        let pattern = pattern(name, variant, "__field");
-        let payload = if variant.fields.is_empty() {
-            TokenStream::new()
-        } else {
-            // The payload's table is indexed by slot, so it is as long as the
-            // highest one the variant declares.
-            let slots = Literal::usize_suffixed(
-                variant
-                    .fields
-                    .iter()
-                    .map(|field| field.slot as usize + 1)
-                    .max()
-                    .expect("the variant has fields"),
-            );
-            let written = variant.fields.iter().enumerate().map(|(index, field)| {
-                let entry = Literal::usize_suffixed(field.slot as usize);
-                let binding = binding("__field", index);
-                let write = match &field.payload {
-                    Payload::Scalar(scalar) => {
-                        let write = format_ident!("write_{}", scalar);
-                        quote!(__writer.#write(*#binding);)
-                    }
-                    Payload::Nested(carried) => {
-                        let schema = schema_of(Nested::Message(carried.schema));
-                        quote! {
-                            <#schema as ::zerialize::Zerializable>::encode_source(
-                                #binding,
-                                __writer,
-                            );
-                        }
-                    }
-                };
-                quote! {
-                    __writer.begin_entry(&__payload, #entry);
-                    #write
-                }
-            });
-            quote! {
-                let __payload = __writer.begin_payload(&__frame, #slots);
-                #(#written)*
-                __writer.end_frame(__payload);
-            }
-        };
-        quote! {
-            #pattern => {
-                let __frame = __writer.begin_variant(#tag);
-                #payload
-                __writer.end_frame(__frame);
-            }
-        }
-    });
+    let encoded = variants.iter().map(|variant| encode_variant(name, variant));
 
     let decoded = variants.iter().map(|variant| {
         let tag = Literal::u32_suffixed(variant.tag);
@@ -1525,11 +1496,15 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
         // over.
         #[doc(hidden)]
         #visibility trait #source {
-            fn __zerialize_encode(&self, __writer: &mut ::zerialize::Writer);
+            fn __zerialize_encode(&self, __writer: &mut ::zerialize::Writer)
+                -> ::zerialize::Offset;
         }
 
         impl #generics #source for #encodable {
-            fn __zerialize_encode(&self, __writer: &mut ::zerialize::Writer) {
+            fn __zerialize_encode(
+                &self,
+                __writer: &mut ::zerialize::Writer,
+            ) -> ::zerialize::Offset {
                 match self {
                     #(#encoded)*
                 }
@@ -1543,7 +1518,7 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
             fn encode_source<'src>(
                 __source: &'src Self::Source<'src>,
                 __writer: &mut ::zerialize::Writer,
-            ) {
+            ) -> ::zerialize::Offset {
                 #source::__zerialize_encode(__source, __writer)
             }
 
@@ -1595,6 +1570,64 @@ fn binding(prefix: &str, index: usize) -> Ident {
     format_ident!("{}{}", prefix, index)
 }
 
+/// The arm encoding one variant: the tag naming it, and the message its fields
+/// are written into, which a variant carrying none does not have.
+fn encode_variant(name: &Ident, variant: &Case<'_>) -> TokenStream {
+    let tag = Literal::u32_suffixed(variant.tag);
+    let pattern = pattern(name, variant, "__field");
+    if variant.fields.is_empty() {
+        return quote! {
+            #pattern => __writer.write_variant(#tag, ::core::option::Option::None),
+        };
+    }
+
+    // What the payload refers to is written before the payload itself, as it is
+    // for any other message.
+    let prepared = variant
+        .fields
+        .iter()
+        .enumerate()
+        .filter_map(|(index, field)| {
+            let (binding, prepared) = (binding("__field", index), binding("__at", index));
+            match &field.payload {
+                Payload::Scalar(_) => None,
+                Payload::Nested(carried) => {
+                    let schema = schema_of(Nested::Message(carried.schema));
+                    Some(quote! {
+                        let #prepared = <#schema as ::zerialize::Zerializable>::encode_source(
+                            #binding,
+                            __writer,
+                        );
+                    })
+                }
+            }
+        });
+
+    let slotted = variant.fields.iter().enumerate().map(|(index, field)| {
+        let slot = Literal::u32_suffixed(field.slot);
+        let (binding, prepared) = (binding("__field", index), binding("__at", index));
+        match &field.payload {
+            Payload::Scalar(scalar) => {
+                let set = format_ident!("set_{}", scalar);
+                quote!(__writer.#set(#slot, *#binding);)
+            }
+            Payload::Nested(_) => quote!(__writer.set_offset(#slot, #prepared);),
+        }
+    });
+
+    quote! {
+        #pattern => {
+            #(#prepared)*
+            let __payload = {
+                let __message = __writer.begin_message();
+                #(#slotted)*
+                __writer.end_message(__message)
+            };
+            __writer.write_variant(#tag, ::core::option::Option::Some(__payload))
+        }
+    }
+}
+
 /// One variant over whatever its fields are given, written the way it was
 /// declared. The same shape is both the expression building a variant and the
 /// pattern matching it, which is what lets one function write either.
@@ -1631,11 +1664,12 @@ struct Value<'a> {
     shape: Shape<'a>,
 }
 
-/// How a value is written where the message that holds it has left room for it.
+/// How a value is written where the message that holds it names it.
 enum Shape<'a> {
-    /// As a frame of fields indexed by slot, exactly like a message.
+    /// As a message of its own, beside the one holding it.
     Struct(Vec<Field<'a>>),
-    /// As the number of the variant, which is all a unit variant carries.
+    /// As the number of the variant, which is all a unit variant carries, in
+    /// the message holding it.
     Enum(Vec<Variant<'a>>),
 }
 
@@ -1762,14 +1796,26 @@ fn parse_variants(data: &DataEnum) -> Result<Vec<Variant<'_>>, Error> {
 
 fn generate_value(value: &Value<'_>) -> TokenStream {
     let Value { name, shape } = value;
-    let (encode, decode) = match shape {
+    let (prepare, write, decode) = match shape {
         Shape::Struct(fields) => generate_struct(fields),
         Shape::Enum(variants) => generate_enum(variants),
     };
     quote! {
         impl ::zerialize::Value for #name {
-            fn encode_value(&self, __writer: &mut ::zerialize::Writer) {
-                #encode
+            fn prepare_value(
+                &self,
+                __writer: &mut ::zerialize::Writer,
+            ) -> ::core::option::Option<::zerialize::Offset> {
+                #prepare
+            }
+
+            fn write_value(
+                &self,
+                __writer: &mut ::zerialize::Writer,
+                __slot: ::core::primitive::u32,
+                __prepared: ::core::option::Option<::zerialize::Offset>,
+            ) {
+                #write
             }
 
             fn decode_value(
@@ -1782,32 +1828,37 @@ fn generate_value(value: &Value<'_>) -> TokenStream {
     }
 }
 
-/// A value struct is a frame, so it is read and written exactly as a message
-/// is, and gains and loses fields with the same consequences.
-fn generate_struct(fields: &[Field<'_>]) -> (TokenStream, TokenStream) {
-    let slots = Literal::usize_suffixed(
-        fields
-            .iter()
-            .map(|field| field.slot as usize + 1)
-            .max()
-            .unwrap_or(0),
-    );
+/// A value struct is a message, so it is read and written exactly as one is,
+/// and gains and loses fields with the same consequences. That leaves it
+/// written beside the message holding it, rather than in it.
+fn generate_struct(fields: &[Field<'_>]) -> (TokenStream, TokenStream, TokenStream) {
+    let prepared = fields.iter().filter_map(|field| {
+        let (name, prepared) = (field.name, binding("__at", field.slot as usize));
+        match &field.kind {
+            FieldKind::Scalar(_) => None,
+            FieldKind::Value(path) => Some(quote! {
+                let #prepared =
+                    <#path as ::zerialize::Value>::prepare_value(&self.#name, __writer);
+            }),
+        }
+    });
 
-    let written = fields.iter().map(|field| {
-        let entry = Literal::usize_suffixed(field.slot as usize);
-        let name = field.name;
-        let write = match &field.kind {
+    let slotted = fields.iter().map(|field| {
+        let slot = Literal::u32_suffixed(field.slot);
+        let (name, prepared) = (field.name, binding("__at", field.slot as usize));
+        match &field.kind {
             FieldKind::Scalar(scalar) => {
-                let write = format_ident!("write_{}", scalar);
-                quote!(__writer.#write(self.#name);)
+                let set = format_ident!("set_{}", scalar);
+                quote!(__writer.#set(#slot, self.#name);)
             }
             FieldKind::Value(path) => quote! {
-                <#path as ::zerialize::Value>::encode_value(&self.#name, __writer);
+                <#path as ::zerialize::Value>::write_value(
+                    &self.#name,
+                    __writer,
+                    #slot,
+                    #prepared,
+                );
             },
-        };
-        quote! {
-            __writer.begin_entry(&__frame, #entry);
-            #write
         }
     });
 
@@ -1828,9 +1879,16 @@ fn generate_struct(fields: &[Field<'_>]) -> (TokenStream, TokenStream) {
 
     (
         quote! {
-            let __frame = __writer.begin_frame(#slots);
-            #(#written)*
-            __writer.end_frame(__frame);
+            #(#prepared)*
+            let __message = __writer.begin_message();
+            #(#slotted)*
+            ::core::option::Option::Some(__writer.end_message(__message))
+        },
+        quote! {
+            __writer.set_offset(
+                __slot,
+                __prepared.expect("a value struct is written as a message of its own"),
+            );
         },
         quote! {
             let __fields = __message.read_message(__slot)?;
@@ -1840,8 +1898,8 @@ fn generate_struct(fields: &[Field<'_>]) -> (TokenStream, TokenStream) {
 }
 
 /// A value enum is its variant number and nothing else, so it costs a `u32`
-/// wherever it is held.
-fn generate_enum(variants: &[Variant<'_>]) -> (TokenStream, TokenStream) {
+/// wherever it is held, written into the message that holds it.
+fn generate_enum(variants: &[Variant<'_>]) -> (TokenStream, TokenStream, TokenStream) {
     let written = variants.iter().map(|variant| {
         let name = variant.name;
         let number = Literal::u32_suffixed(variant.number);
@@ -1856,7 +1914,12 @@ fn generate_enum(variants: &[Variant<'_>]) -> (TokenStream, TokenStream) {
 
     (
         quote! {
-            __writer.write_u32(match self { #(#written)* });
+            let _ = __writer;
+            ::core::option::Option::None
+        },
+        quote! {
+            let _ = __prepared;
+            __writer.set_u32(__slot, match self { #(#written)* });
         },
         quote! {
             match __message.read_u32(__slot)? {

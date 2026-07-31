@@ -1,76 +1,137 @@
-//! Wire format primitives used by `#[zerializable]`-generated code.
+//! FlatBuffers, as the wire format `#[zerializable]`-generated code reads and
+//! writes.
 //!
-//! The encoding is deliberately simple, and is not stable. Messages and lists
-//! are the same primitive, a frame: a length, an entry count, and a table of
-//! offsets indexed by slot number for a message, or by position for a list.
+//! A message is a table: a vtable of `u16` offsets indexed by slot number, and
+//! the fields those offsets address. Scalars are stored in the table itself; a
+//! string, a list, or a nested message is written elsewhere in the buffer and
+//! reached through a `u32` offset the table holds in its place.
 //!
 //! ```text
-//! frame  := len: u64, count: u64, offset[count]: u64, data
-//! str    := len: u64, utf8[len]
-//! bytes  := len: u64, byte[len]
-//! scalar := fixed width, little endian
+//! table  := vtable: i32 backwards from here, fields
+//! vtable := len: u16, table len: u16, offset[]: u16
+//! string := len: u32, utf8[len], NUL
+//! vector := len: u32, offset[len]: u32 forwards from themselves
+//! scalar := fixed width, little endian, aligned to its own width
 //! ```
 //!
-//! An enum is a frame of two entries: the tag naming its variant, and the frame
+//! An enum is a table of two slots: the tag naming its variant, and the message
 //! of that variant's fields, absent when the variant has none. The tag is read
 //! before the payload, so the fields of one variant are free to occupy the same
 //! slots as the fields of another.
 //!
-//! Offsets are relative to the start of their own frame, which leaves 0 free
-//! to mean "absent": no entry can begin inside the header. Indexing the table
-//! by slot number is what makes reading a field a constant number of loads
-//! rather than a walk over the fields before it, and it is why a decoded view
-//! can be nothing more than the bytes of its frame. A reader ignores slots it
-//! does not know by never indexing them, so a schema can gain fields without
-//! breaking readers built against the older one.
+//! A vtable entry of 0, or a vtable too short to reach a slot, means the field
+//! is absent, which is what lets a reader ignore slots it does not know: a
+//! schema can gain fields without breaking readers built against the older one.
+//! Scalars are written even when they are zero, so absent still means absent
+//! rather than "the default", which is what a reader built against a newer
+//! schema needs in order to reject a message that predates its fields.
+//!
+//! Buffers are size prefixed, since a flatbuffer otherwise has no extent of its
+//! own: without it there is nothing to tell trailing bytes apart from a buffer
+//! that simply ends there.
+//!
+//! Writing goes through `flatbuffers::FlatBufferBuilder`, which is what decides
+//! layout, alignment, and which tables may share a vtable. A flatbuffer is
+//! built back to front, so everything a message points at is written before the
+//! message itself: encoding a field is in two parts, one that writes what the
+//! field refers to and one that fills in the slot naming it.
+//!
+//! Reading does not go through the same crate: its accessors are unsafe, and
+//! are sound only against a buffer that was verified first, while a decode here
+//! is what does the verifying. Fields are read below with bounds checks
+//! instead, so that decoding hostile input stays a matter of returning an
+//! error.
 
 use crate::{Error, ListView, Zerializable};
+use flatbuffers::{
+    FLATBUFFERS_MAX_BUFFER_SIZE, FlatBufferBuilder, SIZE_SOFFSET, SIZE_UOFFSET, SIZE_VOFFSET,
+    TableUnfinishedWIPOffset, UnionWIPOffset, VOffsetT, WIPOffset, field_index_to_field_offset,
+};
+use std::cmp::Ordering;
 
-const WORD: usize = size_of::<u64>();
-
-/// Bytes preceding a frame's offset table: its length and entry count.
-const HEADER: usize = 2 * WORD;
+/// Bytes of a vtable preceding its offsets: its own length and the length of
+/// the tables it describes.
+const VTABLE_HEADER: usize = 2 * SIZE_VOFFSET;
 
 /// Maximum message nesting accepted when decoding.
 ///
 /// Validation recurses once per level of nesting, so this bounds stack usage
 /// on hostile input.
-const MAX_DEPTH: u32 = 64;
+const MAX_DEPTH: u16 = 64;
 
-/// Slots of the frame an enum is encoded as.
+/// Slots of the message an enum is encoded as.
 const TAG: u32 = 0;
 const PAYLOAD: u32 = 1;
-const VARIANT_SLOTS: usize = 2;
 
-fn read_word(bytes: &[u8], at: usize) -> Result<usize, Error> {
-    let end = at.checked_add(WORD).ok_or(Error::UnexpectedEof)?;
-    let word = bytes.get(at..end).ok_or(Error::UnexpectedEof)?;
-    // A value that does not fit in a usize cannot address anything in the
-    // buffer, so it is as out of bounds as a value past its end.
-    usize::try_from(u64::from_le_bytes(
-        word.try_into().expect("the slice is exactly a word"),
+/// The highest slot a message may have, since a vtable counts its offsets in
+/// bytes from its own start with a `u16`.
+const MAX_SLOT: u32 = (VOffsetT::MAX as u32 - VTABLE_HEADER as u32) / SIZE_VOFFSET as u32;
+
+fn word(bytes: &[u8], at: usize, size: usize) -> Result<&[u8], Error> {
+    let end = at.checked_add(size).ok_or(Error::UnexpectedEof)?;
+    bytes.get(at..end).ok_or(Error::UnexpectedEof)
+}
+
+fn read_u16(bytes: &[u8], at: usize) -> Result<u16, Error> {
+    let word = word(bytes, at, SIZE_VOFFSET)?;
+    Ok(u16::from_le_bytes(
+        word.try_into().expect("the slice is exactly sized"),
     ))
-    .map_err(|_| Error::UnexpectedEof)
+}
+
+fn read_u32(bytes: &[u8], at: usize) -> Result<u32, Error> {
+    let word = word(bytes, at, SIZE_UOFFSET)?;
+    Ok(u32::from_le_bytes(
+        word.try_into().expect("the slice is exactly sized"),
+    ))
+}
+
+fn read_i32(bytes: &[u8], at: usize) -> Result<i32, Error> {
+    let word = word(bytes, at, SIZE_SOFFSET)?;
+    Ok(i32::from_le_bytes(
+        word.try_into().expect("the slice is exactly sized"),
+    ))
+}
+
+/// Follows the offset stored at `at`, which addresses forwards from itself.
+fn follow(bytes: &[u8], at: usize) -> Result<u32, Error> {
+    let offset = read_u32(bytes, at)? as usize;
+    let target = at.checked_add(offset).ok_or(Error::UnexpectedEof)?;
+    if target >= bytes.len() {
+        return Err(Error::UnexpectedEof);
+    }
+    u32::try_from(target).map_err(|_| Error::UnexpectedEof)
+}
+
+/// Where a slot is recorded in the vtable of the message that holds it.
+fn vtable_slot(slot: u32) -> VOffsetT {
+    assert!(slot <= MAX_SLOT, "slot {slot} is too large to encode");
+    field_index_to_field_offset(slot as VOffsetT)
 }
 
 /// Builds an encoded message.
 #[derive(Default)]
 pub struct Writer {
-    output: Vec<u8>,
+    builder: FlatBufferBuilder<'static>,
 }
 
-/// Position of a frame's header, filled in by [`Writer::end_frame`].
-#[must_use = "the frame is only completed by Writer::end_frame"]
-pub struct FrameMark {
-    start: usize,
-    table: usize,
-}
+/// Where something already written into the buffer begins.
+///
+/// A flatbuffer is built back to front, so an offset is the handle on a string,
+/// a list, or a message that exists in the buffer already, and is what a slot
+/// of the message holding it is filled in with.
+#[derive(Clone, Copy)]
+pub struct Offset(WIPOffset<UnionWIPOffset>);
+
+/// A message under construction, completed by [`Writer::end_message`].
+#[must_use = "the message is only completed by Writer::end_message"]
+pub struct MessageMark(WIPOffset<TableUnfinishedWIPOffset>);
 
 macro_rules! write_scalars {
     ($($name:ident: $ty:ty,)*) => {
         $(
-            pub fn $name(&mut self, value: $ty) {
-                self.output.extend_from_slice(&value.to_le_bytes());
+            pub fn $name(&mut self, slot: u32, value: $ty) {
+                self.builder.push_slot_always(vtable_slot(slot), value);
             }
         )*
     };
@@ -81,149 +142,139 @@ impl Writer {
         Self::default()
     }
 
-    /// Returns the encoded bytes.
-    pub fn finish(self) -> Vec<u8> {
-        self.output
+    /// Returns the encoded bytes, with `root` as the message they hold.
+    pub fn finish(mut self, root: Offset) -> Vec<u8> {
+        self.builder.finish_size_prefixed(root.0, None);
+        self.builder.finished_data().to_vec()
     }
 
-    /// Begins a frame of `count` entries, reserving its offset table. Entries
-    /// left unwritten keep their zeroed offset, and so decode as absent.
-    pub fn begin_frame(&mut self, count: usize) -> FrameMark {
-        let start = self.output.len();
-        self.output.extend_from_slice(&0u64.to_le_bytes());
-        self.output.extend_from_slice(&(count as u64).to_le_bytes());
-        let table = self.output.len();
-        let size = count
-            .checked_mul(WORD)
-            .expect("the frame is too large to encode");
-        self.output.resize(table + size, 0);
-        FrameMark { start, table }
+    /// Begins a message, whose slots are filled in through the `set_` methods
+    /// until [`Writer::end_message`] closes it.
+    ///
+    /// Everything the message refers to must already be written: nothing else
+    /// may be written into the buffer while a message is open.
+    pub fn begin_message(&mut self) -> MessageMark {
+        MessageMark(self.builder.start_table())
     }
 
-    /// Begins the frame of an enum, writing the tag that names its variant.
-    /// The variant's fields follow through [`Writer::begin_payload`].
-    pub fn begin_variant(&mut self, tag: u32) -> FrameMark {
-        let mark = self.begin_frame(VARIANT_SLOTS);
-        self.begin_entry(&mark, TAG as usize);
-        self.write_u32(tag);
-        mark
+    pub fn end_message(&mut self, mark: MessageMark) -> Offset {
+        Offset(self.builder.end_table(mark.0).as_union_value())
     }
 
-    /// Begins the frame holding the fields of the variant `mark` was begun for.
-    /// A variant without fields leaves it unwritten, and so encodes as its tag
-    /// alone.
-    pub fn begin_payload(&mut self, mark: &FrameMark, slots: usize) -> FrameMark {
-        self.begin_entry(mark, PAYLOAD as usize);
-        self.begin_frame(slots)
+    pub fn write_str(&mut self, value: &str) -> Offset {
+        Offset(self.builder.create_string(value).as_union_value())
     }
 
-    /// Records that whatever is written next is the entry at `index`.
-    pub fn begin_entry(&mut self, mark: &FrameMark, index: usize) {
-        let offset = (self.output.len() - mark.start) as u64;
-        let entry = mark.table + index * WORD;
-        self.output[entry..entry + WORD].copy_from_slice(&offset.to_le_bytes());
+    pub fn write_bytes(&mut self, value: &[u8]) -> Offset {
+        Offset(self.builder.create_vector(value).as_union_value())
     }
 
-    /// Backfills the length reserved by [`Writer::begin_frame`].
-    pub fn end_frame(&mut self, mark: FrameMark) {
-        let length = (self.output.len() - mark.start) as u64;
-        self.output[mark.start..mark.start + WORD].copy_from_slice(&length.to_le_bytes());
+    /// Writes a list of messages, each of which is already written.
+    pub fn write_list(&mut self, elements: &[Offset]) -> Offset {
+        let elements = elements.iter().map(|element| element.0);
+        Offset(
+            self.builder
+                .create_vector_from_iter(elements)
+                .as_union_value(),
+        )
     }
 
-    pub fn write_str(&mut self, value: &str) {
-        self.write_bytes(value.as_bytes());
+    /// Writes an enum: the tag naming its variant, and the message holding that
+    /// variant's fields, which a variant carrying none does not have.
+    pub fn write_variant(&mut self, tag: u32, payload: Option<Offset>) -> Offset {
+        let mark = self.begin_message();
+        self.set_u32(TAG, tag);
+        if let Some(payload) = payload {
+            self.set_offset(PAYLOAD, payload);
+        }
+        self.end_message(mark)
     }
 
-    pub fn write_bytes(&mut self, value: &[u8]) {
-        self.output
-            .extend_from_slice(&(value.len() as u64).to_le_bytes());
-        self.output.extend_from_slice(value);
+    pub fn set_offset(&mut self, slot: u32, value: Offset) {
+        self.builder.push_slot_always(vtable_slot(slot), value.0);
     }
 
-    pub fn write_bool(&mut self, value: bool) {
-        self.output.push(u8::from(value));
+    pub fn set_bool(&mut self, slot: u32, value: bool) {
+        self.builder.push_slot_always(vtable_slot(slot), value);
     }
 
     write_scalars! {
-        write_u8: u8,
-        write_u16: u16,
-        write_u32: u32,
-        write_u64: u64,
-        write_i8: i8,
-        write_i16: i16,
-        write_i32: i32,
-        write_i64: i64,
-        write_f32: f32,
-        write_f64: f64,
+        set_u8: u8,
+        set_u16: u16,
+        set_u32: u32,
+        set_u64: u64,
+        set_i8: i8,
+        set_i16: i16,
+        set_i32: i32,
+        set_i64: i64,
+        set_f32: f32,
+        set_f64: f64,
     }
 }
 
-/// A frame's bytes, exactly: its header, offset table and data.
+/// A list of encoded messages: the buffer it lives in, and where in it the
+/// vector's length is.
 ///
-/// Reading an entry is an index into the table, so every operation here is a
-/// constant number of loads no matter how many entries the frame has.
+/// This costs the same as a slice however many elements it covers, and reaching
+/// any one of them is an index into the offsets that follow the length.
 #[derive(Clone, Copy)]
-pub(crate) struct Frame<'buf> {
-    bytes: &'buf [u8],
+pub(crate) struct Vector<'buf> {
+    buf: &'buf [u8],
+    loc: u32,
 }
 
-impl<'buf> Frame<'buf> {
-    /// Reads the frame beginning at the start of `bytes`, checking only that
-    /// its header and offset table are present. Entries are checked as they
-    /// are read, which is what keeps this constant time.
-    pub(crate) fn read(bytes: &'buf [u8]) -> Result<Self, Error> {
-        let length = read_word(bytes, 0)?;
-        let frame = bytes.get(..length).ok_or(Error::UnexpectedEof)?;
-        let count = read_word(frame, WORD)?;
-        let table = count
-            .checked_mul(WORD)
-            .and_then(|size| size.checked_add(HEADER))
+impl<'buf> Vector<'buf> {
+    /// Reads the vector beginning at `loc`, checking only that its length and
+    /// the offsets it counts are present. Elements are checked as they are
+    /// read, which is what keeps this constant time.
+    fn read(buf: &'buf [u8], loc: u32) -> Result<Self, Error> {
+        let at = loc as usize;
+        let elements = read_u32(buf, at)? as usize;
+        let end = elements
+            .checked_mul(SIZE_UOFFSET)
+            .and_then(|size| size.checked_add(at + SIZE_UOFFSET))
             .ok_or(Error::UnexpectedEof)?;
-        if table > frame.len() {
+        if end > buf.len() {
             return Err(Error::UnexpectedEof);
         }
-        Ok(Self { bytes: frame })
+        Ok(Self { buf, loc })
     }
 
-    /// Wraps bytes that are already known to be a frame, because they came
-    /// from a decode that read them.
-    pub(crate) fn trusted(bytes: &'buf [u8]) -> Self {
-        Self { bytes }
+    pub(crate) fn buf(&self) -> &'buf [u8] {
+        self.buf
     }
 
-    pub(crate) fn bytes(&self) -> &'buf [u8] {
-        self.bytes
+    pub(crate) fn len(&self) -> usize {
+        read_u32(self.buf, self.loc as usize)
+            .expect("a vector's length was checked when it was read") as usize
     }
 
-    pub(crate) fn count(&self) -> usize {
-        read_word(self.bytes, WORD).expect("a frame's header was checked when it was read")
-    }
-
-    /// The bytes an entry starts at, or `None` when the frame does not carry
-    /// that entry.
-    pub(crate) fn entry(&self, index: usize) -> Result<Option<&'buf [u8]>, Error> {
-        if index >= self.count() {
+    /// Where the element at `index` begins, or `None` when the vector is not
+    /// that long.
+    pub(crate) fn element(&self, index: usize) -> Result<Option<u32>, Error> {
+        if index >= self.len() {
             return Ok(None);
         }
-        let offset = read_word(self.bytes, HEADER + index * WORD)?;
-        if offset == 0 {
-            return Ok(None);
-        }
-        if offset < HEADER {
-            return Err(Error::UnexpectedEof);
-        }
-        self.bytes
-            .get(offset..)
-            .map(Some)
-            .ok_or(Error::UnexpectedEof)
+        let at = self.loc as usize + SIZE_UOFFSET + index * SIZE_UOFFSET;
+        follow(self.buf, at).map(Some)
     }
 }
 
-/// One encoded message, read by slot.
+/// One encoded message, read by slot: the buffer it lives in, and where in it
+/// the table begins.
+///
+/// A message is not a contiguous run of bytes the way a length prefixed frame
+/// would be: its vtable is shared with every other message whose fields sit at
+/// the same offsets, and everything it points at lies elsewhere in the buffer,
+/// so a position in the whole buffer is the least a handle on one can be.
 #[derive(Clone, Copy)]
 pub struct Message<'buf> {
-    frame: Frame<'buf>,
-    depth: u32,
+    buf: &'buf [u8],
+    /// A flatbuffer addresses itself with 32 bit offsets, so a buffer larger
+    /// than one can address is rejected outright, which is what keeps this and
+    /// [`Vector::loc`] a `u32` rather than widening every handle over a buffer.
+    loc: u32,
+    depth: u16,
     /// Whether nested data is decoded as it is read. Decoding a message
     /// validates it in full, so that accessors on the resulting view cannot
     /// fail; reading through those accessors then skips the work.
@@ -234,8 +285,7 @@ macro_rules! read_scalars {
     ($($name:ident: $ty:ty,)*) => {
         $(
             pub fn $name(&self, slot: u32) -> Result<$ty, Error> {
-                let bytes = self.slot(slot)?;
-                let value = bytes.get(..size_of::<$ty>()).ok_or(Error::UnexpectedEof)?;
+                let value = word(self.buf, self.field(slot)?, size_of::<$ty>())?;
                 Ok(<$ty>::from_le_bytes(
                     value.try_into().expect("the slice is exactly sized"),
                 ))
@@ -245,35 +295,48 @@ macro_rules! read_scalars {
 }
 
 impl<'buf> Message<'buf> {
-    /// Reads the outermost message of a buffer, which must be the whole of it.
-    pub(crate) fn root(bytes: &'buf [u8]) -> Result<Self, Error> {
-        let frame = Frame::read(bytes)?;
-        if frame.bytes().len() != bytes.len() {
-            return Err(Error::TrailingBytes);
+    /// Reads the outermost message of a buffer, which the buffer's size prefix
+    /// must account for exactly.
+    pub(crate) fn root(buf: &'buf [u8]) -> Result<Self, Error> {
+        // A flatbuffer addresses itself with 32 bit offsets, so one larger than
+        // that cannot be read whatever it holds.
+        if buf.len() > FLATBUFFERS_MAX_BUFFER_SIZE {
+            return Err(Error::UnexpectedEof);
+        }
+        let size = read_u32(buf, 0)? as usize;
+        match size.cmp(&(buf.len() - SIZE_UOFFSET)) {
+            Ordering::Less => return Err(Error::TrailingBytes),
+            Ordering::Greater => return Err(Error::UnexpectedEof),
+            Ordering::Equal => (),
         }
         Ok(Self {
-            frame,
+            buf,
+            loc: follow(buf, SIZE_UOFFSET)?,
             depth: 0,
             validate: true,
         })
     }
 
-    /// A message over bytes a previous decode already validated.
+    pub(crate) fn element(buf: &'buf [u8], loc: u32, depth: u16, validate: bool) -> Self {
+        Self {
+            buf,
+            loc,
+            depth,
+            validate,
+        }
+    }
+
+    /// The same message, over bytes a previous decode already validated.
     ///
     /// Only generated accessors should call this: reading through a message
     /// that was not validated can panic.
     #[doc(hidden)]
-    pub fn trusted(bytes: &'buf [u8]) -> Self {
+    pub fn trusted(self) -> Self {
         Self {
-            frame: Frame::trusted(bytes),
             depth: 0,
             validate: false,
+            ..self
         }
-    }
-
-    /// The bytes of this message, which is all a view needs to keep.
-    pub fn bytes(&self) -> &'buf [u8] {
-        self.frame.bytes()
     }
 
     /// Whether generated code should read this message's fields to check them.
@@ -281,8 +344,45 @@ impl<'buf> Message<'buf> {
         self.validate
     }
 
-    fn slot(&self, slot: u32) -> Result<&'buf [u8], Error> {
-        self.frame.entry(slot as usize)?.ok_or(Error::MissingField)
+    /// Where the field at `slot` begins, or `None` when the message does not
+    /// carry it.
+    fn entry(&self, slot: u32) -> Result<Option<usize>, Error> {
+        if slot > MAX_SLOT {
+            return Ok(None);
+        }
+        let table = self.loc as usize;
+        // The vtable is addressed backwards from the table, and is shared by
+        // every table whose fields sit at the same offsets, so it may lie on
+        // either side of the one naming it.
+        let vtable = i64::try_from(table).expect("a buffer is addressed by 32 bits")
+            - i64::from(read_i32(self.buf, table)?);
+        let vtable = usize::try_from(vtable).map_err(|_| Error::UnexpectedEof)?;
+        let length = usize::from(read_u16(self.buf, vtable)?);
+        if length < VTABLE_HEADER {
+            return Err(Error::UnexpectedEof);
+        }
+        let entry = usize::from(vtable_slot(slot));
+        if entry + SIZE_VOFFSET > length {
+            return Ok(None);
+        }
+        match read_u16(self.buf, vtable + entry)? {
+            0 => Ok(None),
+            offset => Ok(Some(
+                table
+                    .checked_add(usize::from(offset))
+                    .ok_or(Error::UnexpectedEof)?,
+            )),
+        }
+    }
+
+    fn field(&self, slot: u32) -> Result<usize, Error> {
+        self.entry(slot)?.ok_or(Error::MissingField)
+    }
+
+    /// Where what the field at `slot` refers to begins: a string, a list, and a
+    /// nested message are all written outside the message naming them.
+    fn indirect(&self, slot: u32) -> Result<u32, Error> {
+        follow(self.buf, self.field(slot)?)
     }
 
     pub fn read_str(&self, slot: u32) -> Result<&'buf str, Error> {
@@ -290,9 +390,9 @@ impl<'buf> Message<'buf> {
     }
 
     pub fn read_bytes(&self, slot: u32) -> Result<&'buf [u8], Error> {
-        let bytes = self.slot(slot)?;
-        let length = read_word(bytes, 0)?;
-        bytes.get(WORD..WORD + length).ok_or(Error::UnexpectedEof)
+        let at = self.indirect(slot)? as usize;
+        let length = read_u32(self.buf, at)? as usize;
+        word(self.buf, at + SIZE_UOFFSET, length)
     }
 
     pub fn read_bool(&self, slot: u32) -> Result<bool, Error> {
@@ -320,9 +420,9 @@ impl<'buf> Message<'buf> {
             return Err(Error::RecursionLimit);
         }
         Ok(Self {
-            frame: Frame::read(self.slot(slot)?)?,
+            loc: self.indirect(slot)?,
             depth: self.depth + 1,
-            validate: self.validate,
+            ..*self
         })
     }
 
@@ -335,19 +435,11 @@ impl<'buf> Message<'buf> {
         if self.depth == MAX_DEPTH {
             return Err(Error::RecursionLimit);
         }
-        let list = ListView::new(Frame::read(self.slot(slot)?)?);
+        let list = ListView::new(Vector::read(self.buf, self.indirect(slot)?)?);
         if self.validate {
             list.validate(self.depth + 1)?;
         }
         Ok(list)
-    }
-
-    pub(crate) fn element(frame: Frame<'buf>, depth: u32, validate: bool) -> Self {
-        Self {
-            frame,
-            depth,
-            validate,
-        }
     }
 
     read_scalars! {

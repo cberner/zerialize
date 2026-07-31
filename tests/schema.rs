@@ -351,8 +351,8 @@ fn a_value_does_not_widen_the_view_that_holds_it() {
     let view = decode::<dyn Hand>(&encoded).unwrap();
 
     // Values are read out of the buffer on access like every other field, so a
-    // view of them is still one slice wide.
-    assert_eq!(size_of_val(&view), size_of::<&[u8]>());
+    // view of them is still the buffer and a position in it.
+    assert_eq!(size_of_val(&view), size_of::<&[u8]>() + size_of::<usize>());
 }
 
 #[zerializable(derive(Debug, PartialEq))]
@@ -675,10 +675,13 @@ fn view_is_a_thin_handle() {
     // contents, a String or a Vec of decoded children, could not be Copy.
     assert_copy(&view);
 
-    // A view is the bytes of its message and nothing else. Fields are read out
-    // of them on access, so a view is one slice wide whatever its schema holds:
-    // a nested message and a list cost exactly what the message itself does.
-    let handle = size_of::<&[u8]>();
+    // A view is where its message is and nothing else: the buffer, and the
+    // position in it the message begins at, which is the least a handle can be
+    // when the message's vtable is shared with every other message shaped like
+    // it. Fields are read out of the buffer on access, so a view is that wide
+    // whatever its schema holds: a nested message and a list cost exactly what
+    // the message itself does.
+    let handle = size_of::<&[u8]>() + size_of::<usize>();
     assert_eq!(size_of_val(&view), handle);
     assert_eq!(size_of_val(&view.address()), handle);
     assert_eq!(size_of_val(&view.children()), handle);

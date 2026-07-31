@@ -13,4 +13,8 @@ repository = "https://github.com/cberner/zerialize"
 authors = ["Christopher Berner <me@cberner.com>"]
 
 [dependencies]
+flatbuffers = "25.12.19"
 zerialize-macros = { version = "0.0.0", path = "macros" }
+
+[dev-dependencies]
+flatbuffers = "25.12.19"
