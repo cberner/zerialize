@@ -6,6 +6,10 @@
 [![License](https://img.shields.io/crates/l/zerialize)](https://crates.io/crates/zerialize)
 [![dependency status](https://deps.rs/repo/github/cberner/zerialize/status.svg)](https://deps.rs/repo/github/cberner/zerialize)
 
+Zerialize provides zero-cost deserialization and a natural interface that allows code to be written
+against the traits, structs, and enums in the codebase, without referencing any generated types.
+
+
 ## License
 
 Licensed under either of
