@@ -3,7 +3,7 @@ use zerialize::{Error, List, OwnedList, decode, encode, zerializable};
 mod location {
     use zerialize::zerializable;
 
-    #[zerializable]
+    #[zerializable(derive(Debug, PartialEq))]
     pub trait Address {
         #[slot(0)]
         fn city(&self) -> &str;
@@ -33,7 +33,7 @@ mod location {
 // scope for `Person` to refer to `Address`.
 use location::{Address, OwnedAddress};
 
-#[zerializable]
+#[zerializable(derive(Debug, PartialEq))]
 trait Person {
     #[slot(0)]
     fn name(&self) -> &str;
@@ -174,7 +174,7 @@ fn view_re_encodes_identically() {
     assert_eq!(encode::<dyn Person>(&view), encoded);
 }
 
-#[zerializable]
+#[zerializable(derive(Debug, PartialEq))]
 trait Primitives {
     #[slot(0)]
     fn flag(&self) -> bool;
@@ -271,7 +271,7 @@ mod cards {
 
 use cards::{Card, Play, Suit};
 
-#[zerializable]
+#[zerializable(derive(Debug, PartialEq))]
 trait Hand {
     #[slot(0)]
     fn player(&self) -> &str;
@@ -355,13 +355,13 @@ fn a_value_does_not_widen_the_view_that_holds_it() {
     assert_eq!(size_of_val(&view), size_of::<&[u8]>());
 }
 
-#[zerializable]
+#[zerializable(derive(Debug, PartialEq))]
 trait Trumps {
     #[slot(0)]
     fn value(&self) -> Suit;
 }
 
-#[zerializable]
+#[zerializable(derive(Debug, PartialEq))]
 trait Numbered {
     #[slot(0)]
     fn value(&self) -> u32;
@@ -423,7 +423,7 @@ mod before {
         pub color: Color,
     }
 
-    #[zerializable]
+    #[zerializable(derive(Debug, PartialEq))]
     pub trait Image {
         #[slot(0)]
         fn pixel(&self) -> Pixel;
@@ -457,7 +457,7 @@ mod after {
         pub alpha: u8,
     }
 
-    #[zerializable]
+    #[zerializable(derive(Debug, PartialEq))]
     pub trait Image {
         #[slot(0)]
         fn pixel(&self) -> Pixel;
@@ -530,7 +530,7 @@ fn unknown_variants_are_rejected() {
 mod v1 {
     use zerialize::zerializable;
 
-    #[zerializable]
+    #[zerializable(derive(Debug, PartialEq))]
     pub trait Record {
         #[slot(0)]
         fn id(&self) -> u32;
@@ -540,7 +540,7 @@ mod v1 {
 mod v2 {
     use zerialize::zerializable;
 
-    #[zerializable]
+    #[zerializable(derive(Debug, PartialEq))]
     pub trait Record {
         #[slot(0)]
         fn id(&self) -> u32;
@@ -698,7 +698,8 @@ fn view_is_a_thin_handle() {
 }
 
 /// A schema declared as an enum, carrying two schemas of its own.
-#[zerializable]
+#[zerializable(derive(PartialEq))]
+#[derive(Debug)]
 enum Role<P: Person, A: Address> {
     #[variant(0)]
     Resident(#[slot(0)] P),
@@ -827,10 +828,80 @@ fn corrupt_enum_input_never_panics() {
     }
 }
 
+/// A schema that asks for nothing, which is what a schema costs by default.
+mod plain {
+    use zerialize::{Zerializable, zerializable};
+
+    /// Neither `Debug` nor `PartialEq`, which a value is no longer required to
+    /// have: only a schema asked to print or compare its fields needs them.
+    #[derive(Zerializable, Copy, Clone)]
+    pub struct Weight {
+        #[slot(0)]
+        pub grams: u32,
+    }
+
+    #[zerializable]
+    pub trait Note {
+        #[slot(0)]
+        fn text(&self) -> &str;
+
+        #[slot(1)]
+        fn weight(&self) -> Weight;
+    }
+
+    // A choice whose `PartialEq` is its own, which is what asking for nothing
+    // leaves available.
+    #[zerializable]
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum Entry<N: Note> {
+        #[variant(0)]
+        Written(#[slot(0)] N),
+        #[variant(1)]
+        Blank,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct OwnedNote(pub &'static str);
+
+    impl Note for OwnedNote {
+        fn text(&self) -> &str {
+            self.0
+        }
+
+        fn weight(&self) -> Weight {
+            Weight { grams: 3 }
+        }
+    }
+}
+
+#[test]
+fn a_schema_asks_for_only_what_it_needs() {
+    use plain::{Entry, Note, OwnedNote};
+
+    // Nothing was asked for, so nothing was generated, and the schema still
+    // round trips: printing and comparing are what a schema is asked for, not
+    // what it is made of.
+    let entry: Entry<OwnedNote> = Entry::Written(OwnedNote("hello"));
+    let encoded = encode::<Entry<dyn Note>>(&entry);
+    match decode::<Entry<dyn Note>>(&encoded).unwrap() {
+        Entry::Written(note) => {
+            assert_eq!(note.text(), "hello");
+            assert_eq!(note.weight().grams, 3);
+        }
+        Entry::Blank => panic!("decoded the wrong variant"),
+    }
+
+    // The enum's own `PartialEq` and `Debug`, which asking for the generic
+    // comparison would have claimed.
+    let blank: Entry<OwnedNote> = Entry::Blank;
+    assert_eq!(blank, blank.clone());
+    assert_ne!(format!("{blank:?}"), format!("{entry:?}"));
+}
+
 /// The same declaration twice, with a `#[derive]` on either side of the
 /// attribute, since the two are meant to read alike.
-#[zerializable]
-#[derive(Clone, Default, Eq, Hash, PartialOrd, Ord)]
+#[zerializable(derive(PartialEq))]
+#[derive(Debug, Clone, Default, Eq, Hash, PartialOrd, Ord)]
 enum Tenancy<A: Address> {
     #[variant(0)]
     #[default]
@@ -840,7 +911,8 @@ enum Tenancy<A: Address> {
 }
 
 #[derive(Clone, Default, Eq, Hash, PartialOrd, Ord)]
-#[zerializable]
+#[zerializable(derive(PartialEq))]
+#[derive(Debug)]
 enum Tenancy2<A: Address> {
     #[variant(0)]
     #[default]
@@ -878,7 +950,7 @@ fn an_enum_derives_on_either_side_of_the_attribute() {
 }
 
 /// A message carrying enums: one on its own, and one per element of a list.
-#[zerializable]
+#[zerializable(derive(Debug, PartialEq))]
 trait Building {
     #[slot(0)]
     fn owner(&self) -> Role<impl Person + '_, impl Address + '_>
@@ -1019,7 +1091,8 @@ fn a_carried_enum_is_part_of_its_message() {
 mod command_v1 {
     use zerialize::zerializable;
 
-    #[zerializable]
+    #[zerializable(derive(PartialEq))]
+    #[derive(Debug)]
     pub enum Command {
         #[variant(0)]
         Wait(#[slot(0)] u32),
@@ -1029,7 +1102,8 @@ mod command_v1 {
 mod command_v2 {
     use zerialize::zerializable;
 
-    #[zerializable]
+    #[zerializable(derive(PartialEq))]
+    #[derive(Debug)]
     pub enum Command {
         #[variant(0)]
         Wait(#[slot(0)] u32, #[slot(1)] bool),

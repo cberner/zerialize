@@ -9,9 +9,10 @@ use proc_macro2::{Literal, TokenStream};
 use quote::{ToTokens, format_ident, quote};
 use syn::{
     Attribute, Data, DataEnum, DataStruct, DeriveInput, Error, Fields, FnArg, GenericArgument,
-    GenericParam, Generics, Ident, Item, ItemEnum, ItemTrait, LitInt, Path, PathArguments,
-    PathSegment, ReceiverKind, ReturnType, Safety, Signature, TraitBound, TraitItem, TraitItemFn,
-    Type, TypeImplTrait, TypeParamBound, TypePath, Visibility, WherePredicate, parse_quote,
+    GenericParam, Generics, Ident, Item, ItemEnum, ItemTrait, LitInt, Meta, Path, PathArguments,
+    PathSegment, ReceiverKind, ReturnType, Safety, Signature, Token, TraitBound, TraitItem,
+    TraitItemFn, Type, TypeImplTrait, TypeParamBound, TypePath, Visibility, WherePredicate,
+    parse_quote, punctuated::Punctuated,
 };
 
 /// Turns a trait or an enum into a zero-copy serialization schema.
@@ -30,6 +31,15 @@ use syn::{
 ///   return references to nested values,
 /// * `impl Zerializable for dyn Trait`, which is how `dyn Trait` comes to name
 ///   the schema in `encode::<dyn Trait>()` and `decode::<dyn Trait>()`.
+///
+/// A view may also be asked to print and compare itself, with
+/// `#[zerializable(derive(Debug, PartialEq))]`. Neither is generated otherwise,
+/// and both are implementations only the schema can write: a view holds bytes
+/// rather than fields, and compares against *any* implementation of its schema,
+/// which is what makes `assert_eq!(decode::<dyn Trait>(&bytes)?, source)` read
+/// the way it does. Whatever a view prints or compares must support it too, so
+/// asking a schema for either asks the same of the schemas and values it
+/// carries.
 ///
 /// Methods may return a scalar, `&str`, `&[u8]`, a value type named outright,
 /// a schema declared as a trait as `impl Trait + '_`, a schema declared as an
@@ -53,10 +63,6 @@ use syn::{
 ///   an implementation of the schema it carries or the name of that schema,
 /// * `impl Zerializable for Enum<dyn Trait, ..>`, which is how the enum over
 ///   the names of the schemas it carries comes to name a schema itself,
-/// * `Debug`, and `PartialEq` between any two instantiations, so that a decoded
-///   enum compares against the value it was encoded from, and so that a message
-///   carrying an enum can print and compare the one it holds. Deriving either is
-///   rejected, since it would be a second implementation of the same trait,
 /// * `as_ref`, which borrows what every variant carries, so that a message
 ///   hands out an enum it stores the way it hands out `&self.nested`.
 ///
@@ -68,11 +74,21 @@ use syn::{
 /// given a type where it is built:
 /// `let worker: Worker<OwnedPerson> = Worker::Engineer(person);`.
 ///
-/// Anything else the enum needs is derived as usual, on either side of the
-/// attribute: `#[derive(Clone, Hash)]` reads the same above it as below it,
-/// because a `derive` below is moved above before it is expanded. Either way
-/// the implementation is bounded by the parameters, as a `derive` writes it, so
-/// `Worker<OwnedPerson>` is `Clone` where `OwnedPerson` is.
+/// The enum is otherwise an ordinary enum, so what it needs is derived as
+/// usual, on either side of the attribute: `#[derive(Debug, Clone, PartialEq)]`
+/// reads the same above it as below it, because a `derive` below is moved above
+/// before it is expanded. Either way the implementation is bounded by the
+/// parameters, as a `derive` writes it, so `Worker<OwnedPerson>` is `Clone`
+/// where `OwnedPerson` is.
+///
+/// `#[zerializable(derive(PartialEq))]` asks for the one implementation a
+/// `derive` cannot write: a comparison between *any two* instantiations, so
+/// that the enum over views compares against the enum over the implementation
+/// it was encoded from. It is what a view carrying an enum needs of it, and it
+/// covers `Worker<OwnedPerson> == Worker<OwnedPerson>` as a special case, so
+/// `#[derive(PartialEq)]` is rejected alongside it. Ask for it where a schema
+/// carrying the enum is compared; derive `PartialEq` where the enum is only
+/// compared against itself.
 ///
 /// A message carries an enum by naming it the way its declaration reads,
 /// `fn role(&self) -> Worker<impl Person + '_> where Self: Sized`, so a schema
@@ -105,7 +121,8 @@ pub fn zerializable(
 
 /// A trait is emitted as it was declared, with the generated code beside it.
 fn expand_trait(args: TokenStream, mut item: ItemTrait) -> TokenStream {
-    let expansion = no_arguments(args).and_then(|()| Ok(generate_schema(&parse_schema(&item)?)));
+    let expansion = parse_arguments(args, true)
+        .and_then(|derived| Ok(generate_schema(&parse_schema(&item)?, derived)));
     // `#[slot(N)]` is consumed here, so it must be stripped from the trait even
     // when the rest of the expansion fails, or the reported error would be a
     // confusing "cannot find attribute `slot`".
@@ -127,9 +144,11 @@ fn expand_trait(args: TokenStream, mut item: ItemTrait) -> TokenStream {
 /// generated with the rest of the expansion. Only a failed expansion emits it
 /// as it was written, which keeps the reported error to the one that matters.
 fn expand_enum(args: TokenStream, mut item: ItemEnum) -> TokenStream {
-    let expansion = no_arguments(args).and_then(|()| match hoist_derives(&item)? {
-        Some(hoisted) => Ok(hoisted),
-        None => Ok(generate_choice(&item, &parse_choice(&item)?)),
+    let expansion = parse_arguments(args.clone(), false).and_then(|derived| {
+        match hoist_derives(&item, &args, derived)? {
+            Some(hoisted) => Ok(hoisted),
+            None => Ok(generate_choice(&item, &parse_choice(&item)?, derived)),
+        }
     });
     match expansion {
         Ok(generated) => generated,
@@ -154,7 +173,11 @@ fn expand_enum(args: TokenStream, mut item: ItemEnum) -> TokenStream {
 /// projection. Swapping the two is therefore all it takes for either order to
 /// mean the same thing. The expansion this returns carries the attribute again,
 /// and terminates because the enum it names has no `derive` left on it.
-fn hoist_derives(item: &ItemEnum) -> Result<Option<TokenStream>, Error> {
+fn hoist_derives(
+    item: &ItemEnum,
+    args: &TokenStream,
+    derived: Derived,
+) -> Result<Option<TokenStream>, Error> {
     let (derives, rest): (Vec<_>, Vec<_>) = item
         .attrs
         .iter()
@@ -163,38 +186,113 @@ fn hoist_derives(item: &ItemEnum) -> Result<Option<TokenStream>, Error> {
         return Ok(None);
     }
     for attribute in &derives {
-        reject_generated(attribute)?;
+        reject_derived(attribute, derived)?;
     }
     let mut item = item.clone();
     item.attrs = rest.into_iter().cloned().collect();
+    let attribute = if args.is_empty() {
+        quote!(#[::zerialize::zerializable])
+    } else {
+        quote!(#[::zerialize::zerializable(#args)])
+    };
     Ok(Some(quote! {
         #(#derives)*
-        #[::zerialize::zerializable]
+        #attribute
         #item
     }))
 }
 
-/// Rejects deriving what the expansion implements itself, which would otherwise
-/// be reported as a pair of conflicting implementations.
-fn reject_generated(attribute: &Attribute) -> Result<(), Error> {
+/// Rejects deriving what the attribute was asked to implement, which would
+/// otherwise be reported as a pair of conflicting implementations.
+fn reject_derived(attribute: &Attribute, derived: Derived) -> Result<(), Error> {
+    if !derived.partial_eq {
+        return Ok(());
+    }
     attribute.parse_nested_meta(|derived| match derived.path.get_ident() {
-        Some(derived) if GENERATED.iter().any(|name| derived == name) => Err(Error::new_spanned(
+        Some(derived) if derived == "PartialEq" => Err(Error::new_spanned(
             derived,
-            format!("#[zerializable] implements {derived} for enums itself"),
+            "#[zerializable(derive(PartialEq))] implements PartialEq against any \
+             instantiation, which covers this one",
         )),
         _ => Ok(()),
     })
 }
 
-fn no_arguments(args: TokenStream) -> Result<(), Error> {
+/// What a schema is asked to implement beyond the schema itself.
+///
+/// Both are asked for rather than generated, because both are implementations
+/// on the schema's own types that nothing else needs: a schema that is never
+/// printed or compared has no use for either, and generating them anyway would
+/// claim traits an author may want to implement differently.
+#[derive(Clone, Copy, Default)]
+struct Derived {
+    debug: bool,
+    partial_eq: bool,
+}
+
+/// Parses `#[zerializable(derive(..))]`.
+///
+/// `Debug` is only offered where the type it would be implemented for is
+/// generated: an enum is declared by its author, so its `Debug` is an ordinary
+/// `#[derive(Debug)]`.
+fn parse_arguments(args: TokenStream, debug_offered: bool) -> Result<Derived, Error> {
     if args.is_empty() {
-        Ok(())
-    } else {
-        Err(Error::new_spanned(
-            args,
-            "#[zerializable] does not take any arguments",
-        ))
+        return Ok(Derived::default());
     }
+    let offered: &[&str] = if debug_offered {
+        &["Debug", "PartialEq"]
+    } else {
+        &["PartialEq"]
+    };
+    let expected = || {
+        Error::new_spanned(
+            args.clone(),
+            format!(
+                "#[zerializable] takes `derive(..)`, over {}",
+                offered.join(" and ")
+            ),
+        )
+    };
+    let Ok(Meta::List(derive)) = syn::parse2::<Meta>(args.clone()) else {
+        return Err(expected());
+    };
+    if !derive.path.is_ident("derive") {
+        return Err(expected());
+    }
+
+    let mut derived = Derived::default();
+    for path in derive.parse_args_with(Punctuated::<Path, Token![,]>::parse_terminated)? {
+        let asked = match path.get_ident() {
+            Some(asked) if offered.contains(&asked.to_string().as_str()) => asked.clone(),
+            // Naming what an enum cannot be asked for is worth more than
+            // reporting it as an unknown name, since `Debug` is spelled the
+            // ordinary way rather than not being available.
+            Some(asked) if asked == "Debug" => {
+                return Err(Error::new_spanned(
+                    &path,
+                    "#[zerializable] enums are printed by #[derive(Debug)], as any enum is",
+                ));
+            }
+            _ => {
+                return Err(Error::new_spanned(
+                    &path,
+                    format!("#[zerializable] implements only {}", offered.join(" and ")),
+                ));
+            }
+        };
+        let already = if asked == "Debug" {
+            std::mem::replace(&mut derived.debug, true)
+        } else {
+            std::mem::replace(&mut derived.partial_eq, true)
+        };
+        if already {
+            return Err(Error::new_spanned(
+                &path,
+                format!("{asked} is derived twice"),
+            ));
+        }
+    }
+    Ok(derived)
 }
 
 fn strip_variant_attributes(item: &mut ItemEnum) {
@@ -217,9 +315,9 @@ fn strip_variant_attributes(item: &mut ItemEnum) {
 /// the older one. An enum may not: a reader rejects a variant it does not know.
 ///
 /// Fields may be scalars or other values, which is what keeps a value `Copy`:
-/// nothing it holds can borrow from the buffer it was read from. The type must
-/// also be `Debug` and `PartialEq`, because the views that carry it print and
-/// compare it.
+/// nothing it holds can borrow from the buffer it was read from. Nothing more
+/// is asked of the type, but a schema asked to print or compare its fields asks
+/// it of this one too, so a value a printed view carries must be `Debug`.
 #[proc_macro_derive(Zerializable, attributes(slot, variant))]
 pub fn derive_zerializable(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let item = match syn::parse::<DeriveInput>(item) {
@@ -376,13 +474,6 @@ fn carries_schemas(path: &TypePath) -> bool {
 const SCALARS: [&str; 11] = [
     "bool", "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64",
 ];
-
-/// What an enum's expansion implements, and so what deriving would collide
-/// with. Both are what a message carrying an enum needs of it, which is why
-/// they come with the enum rather than being left to a `derive`: a view prints
-/// every field it holds, and compares them against another instantiation, which
-/// is a comparison no `derive` writes.
-const GENERATED: [&str; 2] = ["Debug", "PartialEq"];
 
 // ============================================================
 // Parsing
@@ -847,7 +938,7 @@ fn parse_payload<'a>(ty: &'a Type, params: &[Param<'a>]) -> Result<Payload<'a>, 
 // Code generation
 // ============================================================
 
-fn generate_schema(schema: &Schema<'_>) -> TokenStream {
+fn generate_schema(schema: &Schema<'_>, derived: Derived) -> TokenStream {
     const VALIDATED: &str = "the message was validated when it was decoded";
     let Schema {
         visibility,
@@ -1070,6 +1161,34 @@ fn generate_schema(schema: &Schema<'_>) -> TokenStream {
     );
     let view_name = view.to_string();
 
+    // A view is compared against any implementation of its schema, which is
+    // what makes a round trip assertable, and is an implementation only the
+    // schema can write: the view's fields are read out of the buffer.
+    let compared = derived.partial_eq.then(|| {
+        quote! {
+            impl<__S: #name> ::core::cmp::PartialEq<__S> for #view<'_> {
+                fn eq(&self, __other: &__S) -> bool {
+                    #(#comparisons)*
+                    true
+                }
+            }
+        }
+    });
+    let printed = derived.debug.then(|| {
+        quote! {
+            impl ::core::fmt::Debug for #view<'_> {
+                fn fmt(
+                    &self,
+                    __formatter: &mut ::core::fmt::Formatter<'_>,
+                ) -> ::core::fmt::Result {
+                    __formatter.debug_struct(#view_name)
+                        #(#fields)*
+                        .finish()
+                }
+            }
+        }
+    });
+
     quote! {
         // The object safe adapter that gives `encode::<dyn Trait>(&value)` a
         // single dynamic call to dispatch on, rather than one per field.
@@ -1109,23 +1228,8 @@ fn generate_schema(schema: &Schema<'_>) -> TokenStream {
             #(#implemented)*
         }
 
-        impl<__S: #name> ::core::cmp::PartialEq<__S> for #view<'_> {
-            fn eq(&self, __other: &__S) -> bool {
-                #(#comparisons)*
-                true
-            }
-        }
-
-        impl ::core::fmt::Debug for #view<'_> {
-            fn fmt(
-                &self,
-                __formatter: &mut ::core::fmt::Formatter<'_>,
-            ) -> ::core::fmt::Result {
-                __formatter.debug_struct(#view_name)
-                    #(#fields)*
-                    .finish()
-            }
-        }
+        #compared
+        #printed
 
         impl ::zerialize::Zerializable for dyn #name {
             type Source<'src> = dyn #source + 'src;
@@ -1164,7 +1268,7 @@ fn instantiate<T: ToTokens>(name: &Ident, arguments: &[T]) -> TokenStream {
     }
 }
 
-fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>) -> TokenStream {
+fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> TokenStream {
     let Choice {
         visibility,
         name,
@@ -1289,24 +1393,10 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>) -> TokenStream {
         }
     });
 
-    // Debug and a comparison across instantiations are what a message carrying
-    // an enum needs of it: a view prints and compares every field it holds, and
-    // the enum a view holds is the enum over views, while the one it is compared
-    // against is the enum over some other implementation. A `derive` provides
-    // neither, since it cannot see through the payloads.
-    let debug_generics = parameters_bounded_by(params, quote!(::core::fmt::Debug));
-    let printed = variants.iter().map(|variant| {
-        let pattern = pattern(name, variant, "__field");
-        let label = variant.name.to_string();
-        let fields = (0..variant.fields.len()).map(|index| {
-            let binding = binding("__field", index);
-            quote!(.field(#binding))
-        });
-        quote! {
-            #pattern => __formatter.debug_tuple(#label)#(#fields)*.finish(),
-        }
-    });
-
+    // A comparison across instantiations is what a view carrying an enum needs
+    // of it: the enum a view holds is the enum over views, while the one it is
+    // compared against is the enum over some other implementation. A `derive`
+    // writes `PartialEq<Self>` and so cannot say that.
     let others = params
         .iter()
         .map(|param| format_ident!("__Other{}", param.name))
@@ -1358,23 +1448,35 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>) -> TokenStream {
         "Borrows what every variant carries, so that a `{name}` an \
          implementation stores can be handed out as the one it encodes as."
     );
-    let compared = variants.iter().map(|variant| {
-        let mine = pattern(name, variant, "__field");
-        let theirs = pattern(name, variant, "__other");
-        let equal = (0..variant.fields.len()).map(|index| {
-            let (mine, theirs) = (binding("__field", index), binding("__other", index));
-            quote!(#mine == #theirs)
+    let compared = derived.partial_eq.then(|| {
+        let arms = variants.iter().map(|variant| {
+            let mine = pattern(name, variant, "__field");
+            let theirs = pattern(name, variant, "__other");
+            let equal = (0..variant.fields.len()).map(|index| {
+                let (mine, theirs) = (binding("__field", index), binding("__other", index));
+                quote!(#mine == #theirs)
+            });
+            quote! {
+                (#mine, #theirs) => true #(&& #equal)*,
+            }
         });
+        // A single variant leaves nothing for a catch all arm to match.
+        let unequal = if variants.len() > 1 {
+            quote!(_ => false,)
+        } else {
+            TokenStream::new()
+        };
         quote! {
-            (#mine, #theirs) => true #(&& #equal)*,
+            impl #compared_generics ::core::cmp::PartialEq<#compared_to> for #encodable {
+                fn eq(&self, __other: &#compared_to) -> bool {
+                    match (self, __other) {
+                        #(#arms)*
+                        #unequal
+                    }
+                }
+            }
         }
     });
-    // A single variant leaves nothing for a catch all arm to match.
-    let unequal = if variants.len() > 1 {
-        quote!(_ => false,)
-    } else {
-        TokenStream::new()
-    };
 
     quote! {
         #declaration
@@ -1389,25 +1491,7 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>) -> TokenStream {
             }
         }
 
-        impl #debug_generics ::core::fmt::Debug for #encodable {
-            fn fmt(
-                &self,
-                __formatter: &mut ::core::fmt::Formatter<'_>,
-            ) -> ::core::fmt::Result {
-                match self {
-                    #(#printed)*
-                }
-            }
-        }
-
-        impl #compared_generics ::core::cmp::PartialEq<#compared_to> for #encodable {
-            fn eq(&self, __other: &#compared_to) -> bool {
-                match (self, __other) {
-                    #(#compared)*
-                    #unequal
-                }
-            }
-        }
+        #compared
 
         // The object safe adapter that gives `encode::<Enum<dyn Trait>>(&value)`
         // one dynamic call to dispatch on, whatever the enum is instantiated
@@ -1492,19 +1576,6 @@ fn pattern(name: &Ident, variant: &Case<'_>, prefix: &str) -> TokenStream {
         let bindings = (0..variant.fields.len()).map(|index| binding(prefix, index));
         quote!(#name::#variant_name(#(#bindings),*))
     }
-}
-
-/// The enum's parameters, each bounded by the schema it carries and by `also`,
-/// as the generics of an implementation.
-fn parameters_bounded_by(params: &[Param<'_>], also: TokenStream) -> TokenStream {
-    if params.is_empty() {
-        return TokenStream::new();
-    }
-    let bounds = params.iter().map(|param| {
-        let (name, schema) = (param.name, param.schema);
-        quote!(#name: #schema + #also)
-    });
-    quote!(<#(#bounds),*>)
 }
 
 // ============================================================
