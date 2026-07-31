@@ -11,6 +11,11 @@
 //! scalar := fixed width, little endian
 //! ```
 //!
+//! An enum is a frame of two entries: the tag naming its variant, and the frame
+//! of that variant's fields, absent when the variant has none. The tag is read
+//! before the payload, so the fields of one variant are free to occupy the same
+//! slots as the fields of another.
+//!
 //! Offsets are relative to the start of their own frame, which leaves 0 free
 //! to mean "absent": no entry can begin inside the header. Indexing the table
 //! by slot number is what makes reading a field a constant number of loads
@@ -31,6 +36,11 @@ const HEADER: usize = 2 * WORD;
 /// Validation recurses once per level of nesting, so this bounds stack usage
 /// on hostile input.
 const MAX_DEPTH: u32 = 64;
+
+/// Slots of the frame an enum is encoded as.
+const TAG: u32 = 0;
+const PAYLOAD: u32 = 1;
+const VARIANT_SLOTS: usize = 2;
 
 fn read_word(bytes: &[u8], at: usize) -> Result<usize, Error> {
     let end = at.checked_add(WORD).ok_or(Error::UnexpectedEof)?;
@@ -88,6 +98,23 @@ impl Writer {
             .expect("the frame is too large to encode");
         self.output.resize(table + size, 0);
         FrameMark { start, table }
+    }
+
+    /// Begins the frame of an enum, writing the tag that names its variant.
+    /// The variant's fields follow through [`Writer::begin_payload`].
+    pub fn begin_variant(&mut self, tag: u32) -> FrameMark {
+        let mark = self.begin_frame(VARIANT_SLOTS);
+        self.begin_entry(&mark, TAG as usize);
+        self.write_u32(tag);
+        mark
+    }
+
+    /// Begins the frame holding the fields of the variant `mark` was begun for.
+    /// A variant without fields leaves it unwritten, and so encodes as its tag
+    /// alone.
+    pub fn begin_payload(&mut self, mark: &FrameMark, slots: usize) -> FrameMark {
+        self.begin_entry(mark, PAYLOAD as usize);
+        self.begin_frame(slots)
     }
 
     /// Records that whatever is written next is the entry at `index`.
@@ -274,6 +301,17 @@ impl<'buf> Message<'buf> {
             1 => Ok(true),
             _ => Err(Error::InvalidBool),
         }
+    }
+
+    /// Reads the tag of an encoded enum, naming the variant it holds.
+    pub fn read_tag(&self) -> Result<u32, Error> {
+        self.read_u32(TAG)
+    }
+
+    /// Reads the fields of the variant an enum holds, which are only meaningful
+    /// once its tag has been read.
+    pub fn read_payload(&self) -> Result<Message<'buf>, Error> {
+        self.read_message(PAYLOAD)
     }
 
     /// Reads a nested message, which inherits this one's validation mode.

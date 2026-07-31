@@ -83,6 +83,61 @@
 //! let bytes = encode::<dyn Reading>(&reading);
 //! assert_eq!(decode::<dyn Reading>(&bytes).unwrap().temperature(), reading.0);
 //! ```
+//!
+//! # Choices
+//!
+//! A schema may also be a choice between messages, written as an enum whose
+//! variants declare the tag naming them on the wire, and whose fields declare
+//! their slots as a message's do:
+//!
+//! ```
+//! use zerialize::{decode, encode, zerializable};
+//!
+//! # #[zerializable]
+//! # trait Point {
+//! #     #[slot(0)]
+//! #     fn x(&self) -> i32;
+//! #     #[slot(1)]
+//! #     fn y(&self) -> i32;
+//! # }
+//! # struct OwnedPoint {
+//! #     x: i32,
+//! #     y: i32,
+//! # }
+//! # impl Point for OwnedPoint {
+//! #     fn x(&self) -> i32 {
+//! #         self.x
+//! #     }
+//! #     fn y(&self) -> i32 {
+//! #         self.y
+//! #     }
+//! # }
+//! #[zerializable]
+//! enum Shape<P: Point> {
+//!     #[variant(0)]
+//!     Dot(#[slot(0)] P),
+//!     #[variant(1)]
+//!     Empty,
+//! }
+//!
+//! let dot: Shape<OwnedPoint> = Shape::Dot(OwnedPoint { x: 1, y: 2 });
+//! let bytes = encode::<Shape<dyn Point>>(&dot);
+//! match decode::<Shape<dyn Point>>(&bytes).unwrap() {
+//!     Shape::Dot(point) => assert_eq!((point.x(), point.y()), (1, 2)),
+//!     Shape::Empty => unreachable!(),
+//! }
+//! ```
+//!
+//! An enum is generic over the schemas it carries, which is what lets the same
+//! declaration be a value, `Shape<OwnedPoint>`, the name of the schema that
+//! value encodes as, `Shape<dyn Point>`, and, once decoded, the enum over
+//! views, `Shape<PointView<'_>>`. Since a variant's payload is written in terms
+//! of its parameter, building a value means giving it a type, as `dot` is given
+//! one above.
+//!
+//! A message carries an enum by naming it the way its declaration reads, as
+//! `fn shape(&self) -> Shape<impl Point + '_> where Self: Sized`, so a schema is
+//! free to be a tree of messages and choices.
 
 #![forbid(unsafe_code)]
 
@@ -171,3 +226,31 @@ where
 {
     <S as Zerializable>::decode_view(Message::root(bytes)?)
 }
+
+/// What a schema argument stands for.
+///
+/// A generated enum is generic over the schemas its variants carry, which is
+/// what lets one declaration be both an ordinary value, `Worker<OwnedPerson>`,
+/// and the name of the schema that value encodes as, `Worker<dyn Person>`. An
+/// implementation stands for itself, so a variant of `Worker<OwnedPerson>`
+/// carries an `OwnedPerson`; a schema stands for [`SchemaOnly`], so the same
+/// variant of `Worker<dyn Person>` carries nothing that can be constructed.
+///
+/// The blanket implementation covers every sized type, and [`macro@zerializable`]
+/// implements this for the `dyn Trait` that names a schema. Code generic over a
+/// schema an enum carries should bound its parameter by that schema's trait
+/// rather than by this, which is what lets the payload resolve to the parameter
+/// itself.
+pub trait SchemaArg {
+    type Value;
+}
+
+impl<T> SchemaArg for T {
+    type Value = T;
+}
+
+/// What a variant carries under the name of a schema.
+///
+/// `Worker<dyn Person>` names a schema rather than holding one, so its variants
+/// carry this, which no value inhabits.
+pub enum SchemaOnly {}
