@@ -72,10 +72,13 @@ fn read_word(bytes: &[u8], at: usize) -> Result<usize, Error> {
     .map_err(|_| Error::UnexpectedEof)
 }
 
-/// Builds an encoded message.
-#[derive(Default)]
-pub struct Writer {
-    output: Vec<u8>,
+/// Builds an encoded message at the end of a buffer.
+///
+/// Every offset a frame holds is relative to the start of that frame, so a
+/// message is position independent: what a writer appends decodes the same
+/// whether the buffer was empty or already held other messages.
+pub struct Writer<'out> {
+    output: &'out mut Vec<u8>,
 }
 
 /// Position of a frame's header, filled in by [`Writer::end_frame`].
@@ -95,14 +98,10 @@ macro_rules! write_scalars {
     };
 }
 
-impl Writer {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Returns the encoded bytes.
-    pub fn finish(self) -> Vec<u8> {
-        self.output
+impl<'out> Writer<'out> {
+    /// Writes at the end of `output`, leaving what it already holds alone.
+    pub fn new(output: &'out mut Vec<u8>) -> Self {
+        Self { output }
     }
 
     /// Begins a frame of `count` entries, reserving its offset table. Entries

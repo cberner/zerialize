@@ -351,6 +351,7 @@ mod list;
 mod wire;
 
 use std::fmt::{self, Display, Formatter};
+use std::ops::Range;
 
 pub use list::{Copied, Element, List, ListIter, ListView, OwnedList};
 pub use wire::{FrameMark, Message, Writer};
@@ -407,7 +408,7 @@ pub trait Zerializable {
     type View<'buf>: 'buf;
 
     #[doc(hidden)]
-    fn encode_source<'src>(source: &'src Self::Source<'src>, writer: &mut Writer);
+    fn encode_source<'src>(source: &'src Self::Source<'src>, writer: &mut Writer<'_>);
 
     #[doc(hidden)]
     fn decode_view<'buf>(message: Message<'buf>) -> Result<Self::View<'buf>, Error>;
@@ -437,9 +438,49 @@ pub fn encode<'src, S>(source: &'src S::Source<'src>) -> Vec<u8>
 where
     S: Zerializable + ?Sized,
 {
-    let mut writer = Writer::new();
-    <S as Zerializable>::encode_source(source, &mut writer);
-    writer.finish()
+    let mut output = Vec::new();
+    encode_in::<S>(source, &mut output);
+    output
+}
+
+/// Encodes `source` as the schema `S` at the end of `out`, and returns the
+/// range of `out` it was written to.
+///
+/// What `out` already holds is left alone, so one buffer can carry several
+/// messages, and one allocation can be reused across encodings by clearing it
+/// rather than dropping it. A message is decoded from exactly its own bytes,
+/// which is what the returned range is for:
+///
+/// ```
+/// use zerialize::{decode, encode_in, zerializable};
+///
+/// #[zerializable]
+/// trait Point {
+///     #[n(0)]
+///     fn x(&self) -> i32;
+/// }
+///
+/// struct OwnedPoint(i32);
+/// # impl Point for OwnedPoint {
+/// #     fn x(&self) -> i32 {
+/// #         self.0
+/// #     }
+/// # }
+///
+/// let mut buffer = Vec::new();
+/// let first = encode_in::<dyn Point>(&OwnedPoint(1), &mut buffer);
+/// let second = encode_in::<dyn Point>(&OwnedPoint(2), &mut buffer);
+///
+/// assert_eq!(decode::<dyn Point>(&buffer[first]).unwrap().x(), 1);
+/// assert_eq!(decode::<dyn Point>(&buffer[second]).unwrap().x(), 2);
+/// ```
+pub fn encode_in<'src, S>(source: &'src S::Source<'src>, out: &mut Vec<u8>) -> Range<usize>
+where
+    S: Zerializable + ?Sized,
+{
+    let start = out.len();
+    <S as Zerializable>::encode_source(source, &mut Writer::new(out));
+    start..out.len()
 }
 
 /// Decodes a view of `bytes` as the schema `S`.

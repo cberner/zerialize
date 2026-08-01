@@ -178,7 +178,7 @@ pub trait Element {
     type Item<'buf>;
 
     #[doc(hidden)]
-    fn encode_element<'src>(source: &'src Self::Source<'src>, writer: &mut Writer);
+    fn encode_element<'src>(source: &'src Self::Source<'src>, writer: &mut Writer<'_>);
 
     #[doc(hidden)]
     fn decode_element<'buf>(list: Message<'buf>, index: u32) -> Result<Self::Item<'buf>, Error>;
@@ -191,7 +191,7 @@ macro_rules! primitive_elements {
                 type Source<'src> = $ty;
                 type Item<'buf> = $ty;
 
-                fn encode_element(source: &$ty, writer: &mut Writer) {
+                fn encode_element(source: &$ty, writer: &mut Writer<'_>) {
                     writer.$write(*source);
                 }
 
@@ -230,7 +230,7 @@ impl Element for str {
     type Source<'src> = str;
     type Item<'buf> = &'buf str;
 
-    fn encode_element(source: &str, writer: &mut Writer) {
+    fn encode_element(source: &str, writer: &mut Writer<'_>) {
         writer.write_str(source);
     }
 
@@ -243,7 +243,7 @@ impl Element for [u8] {
     type Source<'src> = [u8];
     type Item<'buf> = &'buf [u8];
 
-    fn encode_element(source: &[u8], writer: &mut Writer) {
+    fn encode_element(source: &[u8], writer: &mut Writer<'_>) {
         writer.write_bytes(source);
     }
 
