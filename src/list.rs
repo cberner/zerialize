@@ -1,7 +1,7 @@
 //! Sequences of elements.
 
 use crate::Error;
-use crate::wire::{Frame, Message};
+use crate::wire::{Frame, Message, Writer};
 use std::fmt::{self, Debug};
 use std::marker::PhantomData;
 
@@ -152,30 +152,48 @@ impl<'a, T> List for &'a OwnedList<T> {
     }
 }
 
-/// What a list holds.
+/// What an entry of a frame holds.
 ///
 /// A list is a frame, exactly as a message is, with its entries indexed by
-/// position rather than by slot. Reading an element is therefore reading a
-/// field, which is why this has the shape [`crate::Value::decode_value`] has:
-/// an element is addressed by its index rather than handed its bytes, because
-/// it chooses its own shape on the wire.
+/// position rather than by slot, so an element and a field are the same thing:
+/// both are addressed by the entry they occupy rather than handed their bytes,
+/// because each chooses its own shape on the wire. That is what lets one trait
+/// stand for both, and it is what decides whether a name a field is written
+/// with is a value or a choice: which of them it is, is which implementation of
+/// this exists, rather than how the name is written.
 ///
 /// Implemented here for the primitives, and by the macros for every schema and
-/// value, so that a list holds any of them.
+/// value.
 pub trait Element {
+    /// Types that may be encoded as this element.
+    ///
+    /// This is a GAT so sources containing borrowed data work, and is what a
+    /// schema stands apart from an implementation of it by: the source of a
+    /// choice is any instantiation of it, and the source of a value is the
+    /// value itself.
+    type Source<'src>: ?Sized + 'src;
+
     /// What reading one element gives back, which borrows from the buffer
     /// wherever the element itself does.
     type Item<'buf>;
+
+    #[doc(hidden)]
+    fn encode_element<'src>(source: &'src Self::Source<'src>, writer: &mut Writer);
 
     #[doc(hidden)]
     fn decode_element<'buf>(list: Message<'buf>, index: u32) -> Result<Self::Item<'buf>, Error>;
 }
 
 macro_rules! primitive_elements {
-    ($($ty:ty: $read:ident,)*) => {
+    ($($ty:ty: $write:ident, $read:ident,)*) => {
         $(
             impl Element for $ty {
+                type Source<'src> = $ty;
                 type Item<'buf> = $ty;
+
+                fn encode_element(source: &$ty, writer: &mut Writer) {
+                    writer.$write(*source);
+                }
 
                 fn decode_element<'buf>(
                     list: Message<'buf>,
@@ -189,27 +207,32 @@ macro_rules! primitive_elements {
 }
 
 primitive_elements! {
-    bool: read_bool,
-    char: read_char,
-    u8: read_u8,
-    u16: read_u16,
-    u32: read_u32,
-    u64: read_u64,
-    u128: read_u128,
-    i8: read_i8,
-    i16: read_i16,
-    i32: read_i32,
-    i64: read_i64,
-    i128: read_i128,
-    f32: read_f32,
-    f64: read_f64,
+    bool: write_bool, read_bool,
+    char: write_char, read_char,
+    u8: write_u8, read_u8,
+    u16: write_u16, read_u16,
+    u32: write_u32, read_u32,
+    u64: write_u64, read_u64,
+    u128: write_u128, read_u128,
+    i8: write_i8, read_i8,
+    i16: write_i16, read_i16,
+    i32: write_i32, read_i32,
+    i64: write_i64, read_i64,
+    i128: write_i128, read_i128,
+    f32: write_f32, read_f32,
+    f64: write_f64, read_f64,
 }
 
 // The two elements that are read as handles over the buffer rather than copied
-// out of it are named by what they point at, since what a list holds is the
+// out of it are named by what they point at, since what a frame holds is the
 // element rather than the reference to it.
 impl Element for str {
+    type Source<'src> = str;
     type Item<'buf> = &'buf str;
+
+    fn encode_element(source: &str, writer: &mut Writer) {
+        writer.write_str(source);
+    }
 
     fn decode_element<'buf>(list: Message<'buf>, index: u32) -> Result<&'buf str, Error> {
         list.read_str(index)
@@ -217,7 +240,12 @@ impl Element for str {
 }
 
 impl Element for [u8] {
+    type Source<'src> = [u8];
     type Item<'buf> = &'buf [u8];
+
+    fn encode_element(source: &[u8], writer: &mut Writer) {
+        writer.write_bytes(source);
+    }
 
     fn decode_element<'buf>(list: Message<'buf>, index: u32) -> Result<&'buf [u8], Error> {
         list.read_bytes(index)
