@@ -27,6 +27,8 @@ An optional field is absent on the wire when it is `None`, which is exactly what
 a field the writer did not have, so a field added as an optional one can be read out of messages
 written before it existed.
 
+Containers may contain any primitive, container type, value type, view trait, or view enum.
+
 ### Value types
 Value types are copied, and may be structs or enums, without generic parameters. They must implement
 `Copy`, and hold nothing borrowed: a `&str` field belongs to a view schema trait or a view enum.
@@ -61,6 +63,9 @@ enum Protocol {
 }
 ```
 
+Value types may only contain primitives or other value types. They may not contain container types,
+view traits, or view enums.
+
 ### View schema traits
 View traits provide zero copy access to their data. A method that returns an `impl Trait` must be
 guarded with
@@ -86,6 +91,8 @@ trait Person {
 }
 ```
 
+View schema traits may contain any primitive, container type, value type, view trait, or view enum.
+
 ### View enums
 View enums provide zero copy access to view traits behind a generic parameter. Their other fields
 are copied, except `&str` and `&[u8]`, which point into the buffer as a view trait's do.
@@ -108,6 +115,8 @@ An enum with a borrowed field declares the lifetime it points into, and is named
 is named: `Mammal<'_, dyn Person>` is the schema, and decoding it gives
 `Mammal<'buf, PersonView<'buf>>`. An enum that borrows nothing declares no lifetime, and is named
 without one.
+
+View enums may contain any primitive, container type, value type, view trait, or view enum.
 
 ## License
 
