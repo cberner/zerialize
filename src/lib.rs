@@ -44,7 +44,10 @@
 //!
 //! A `Copy` struct or enum annotated with [`macro@Zerializable`] is a *value*:
 //! a field type that decodes back to itself rather than to a view, because
-//! there is nothing in it that could borrow from the buffer.
+//! there is nothing in it that could borrow from the buffer. A value enum's
+//! variants may carry fields of their own, as the struct beside them does; what
+//! separates a value from a choice is that a value holds nothing borrowed, and
+//! so is read out whole.
 //!
 //! ```
 //! use zerialize::{Zerializable, decode, encode, zerializable};
@@ -83,6 +86,45 @@
 //! let bytes = encode::<dyn Reading>(&reading);
 //! assert_eq!(decode::<dyn Reading>(&bytes).unwrap().temperature(), reading.0);
 //! ```
+//!
+//! # Optional fields
+//!
+//! Any field may be wrapped in an `Option`, which makes it one a message need
+//! not carry:
+//!
+//! ```
+//! use zerialize::{decode, encode, zerializable};
+//!
+//! #[zerializable]
+//! trait Station {
+//!     #[n(0)]
+//!     fn degrees(&self) -> f32;
+//!
+//!     #[n(1)]
+//!     fn name(&self) -> Option<&str>;
+//! }
+//!
+//! struct OwnedStation(f32, Option<&'static str>);
+//!
+//! impl Station for OwnedStation {
+//!     fn degrees(&self) -> f32 {
+//!         self.0
+//!     }
+//!     fn name(&self) -> Option<&str> {
+//!         self.1
+//!     }
+//! }
+//!
+//! let bytes = encode::<dyn Station>(&OwnedStation(21.5, None));
+//! assert_eq!(decode::<dyn Station>(&bytes).unwrap().name(), None);
+//! ```
+//!
+//! `None` is the slot left unwritten, which is exactly what a reader sees of a
+//! slot the writer did not have. A field added as an optional one is therefore
+//! readable out of a message written before it existed, where a required one
+//! would be [`Error::MissingField`], and a reader built before it skips it as it
+//! skips any slot it does not know. There is only one way for a slot to be
+//! absent, so `Option<Option<..>>` is rejected.
 //!
 //! # Choices
 //!
@@ -147,6 +189,29 @@
 //! field on the wire is its slot either way, so naming a field, or renaming
 //! one, changes how the enum reads rather than what it encodes as.
 //!
+//! A variant may also carry a field that borrows, which is a handle over the
+//! buffer as the same field is where a message holds it. An enum that has one
+//! declares the lifetime it points into, and is named with that lifetime
+//! wherever it is named:
+//!
+//! ```
+//! # use zerialize::{decode, encode, zerializable};
+//! #[zerializable(derive(PartialEq))]
+//! #[derive(Debug)]
+//! enum Label<'a> {
+//!     #[variant(0)]
+//!     Text(#[n(0)] &'a str),
+//!     #[variant(1)]
+//!     None,
+//! }
+//!
+//! let bytes = encode::<Label<'_>>(&Label::Text("hello"));
+//! assert_eq!(decode::<Label<'_>>(&bytes).unwrap(), Label::Text("hello"));
+//! ```
+//!
+//! Only an enum that borrows declares a lifetime, so one that does not is named
+//! as it was before: `Shape<dyn Point>`, not `Shape<'_, dyn Point>`.
+//!
 //! The enum is otherwise an ordinary enum, so what it needs is derived, above
 //! the attribute or below it, bounding the enum's parameters the way a `derive`
 //! does: `Shape<OwnedPoint>` is `Clone` where `OwnedPoint` is.
@@ -202,7 +267,7 @@
 mod list;
 mod wire;
 
-pub use list::{List, ListIter, ListView, OwnedList};
+pub use list::{Copied, Element, List, ListIter, ListView, OwnedList};
 pub use wire::{FrameMark, Message, Writer};
 pub use zerialize_macros::{Zerializable, zerializable};
 
@@ -211,6 +276,8 @@ pub enum Error {
     UnexpectedEof,
     InvalidUtf8,
     InvalidBool,
+    /// A `char` that is not a Unicode scalar value.
+    InvalidChar,
     TrailingBytes,
     MissingField,
     RecursionLimit,

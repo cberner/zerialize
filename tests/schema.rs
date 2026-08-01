@@ -1,4 +1,4 @@
-use zerialize::{Error, List, OwnedList, decode, encode, zerializable};
+use zerialize::{Error, List, OwnedList, Writer, decode, encode, zerializable};
 
 mod location {
     use zerialize::zerializable;
@@ -616,6 +616,24 @@ fn invalid_utf8_is_rejected() {
     assert_eq!(
         decode::<dyn Person>(&encoded).unwrap_err(),
         Error::InvalidUtf8
+    );
+}
+
+#[test]
+fn a_length_that_cannot_be_added_to_is_rejected() {
+    // A length word is a claim about the buffer rather than a length: the
+    // largest one there is names bytes past the end of every buffer, so it has
+    // to be rejected before it is added to an offset.
+    let mut writer = Writer::new();
+    let frame = writer.begin_frame(1);
+    writer.begin_entry(&frame, 0);
+    writer.write_u64(u64::MAX);
+    writer.end_frame(frame);
+    let encoded = writer.finish();
+
+    assert_eq!(
+        decode::<dyn Person>(&encoded).unwrap_err(),
+        Error::UnexpectedEof
     );
 }
 
