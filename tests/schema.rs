@@ -1,4 +1,4 @@
-use zerialize::{Error, List, OwnedList, Writer, decode, encode, zerializable};
+use zerialize::{Error, List, OwnedList, Writer, decode, encode, encode_in, zerializable};
 
 mod location {
     use zerialize::zerializable;
@@ -172,6 +172,52 @@ fn view_re_encodes_identically() {
 
     // A view implements the schema trait, so it is itself an encodable source.
     assert_eq!(encode::<dyn Person>(&view), encoded);
+}
+
+#[test]
+fn encoding_into_a_buffer_appends_to_it() {
+    let person = family();
+    let mut buffer = vec![0xff; 3];
+    let first = encode_in::<dyn Person>(&person, &mut buffer);
+    let second = encode_in::<dyn Person>(&OwnedPerson::new("Jack", vec![]), &mut buffer);
+
+    // What the buffer already held is untouched, and a message encodes the
+    // same wherever it lands: offsets are relative to their own frame.
+    assert_eq!(&buffer[..3], [0xff; 3]);
+    assert_eq!(first, 3..second.start);
+    assert_eq!(&buffer[first.clone()], encode::<dyn Person>(&person));
+
+    assert_eq!(
+        decode::<dyn Person>(&buffer[first.clone()]).unwrap(),
+        person
+    );
+    assert_eq!(
+        decode::<dyn Person>(&buffer[second]).unwrap().name(),
+        "Jack"
+    );
+    // A message is decoded from exactly its own bytes, which is what the
+    // returned range is for: the bytes of the one beside it are trailing.
+    assert_eq!(
+        decode::<dyn Person>(&buffer[first.start..]).unwrap_err(),
+        Error::TrailingBytes
+    );
+}
+
+#[test]
+fn a_buffer_may_be_cleared_and_reused() {
+    let person = family();
+    let mut buffer = Vec::new();
+    encode_in::<dyn Person>(&person, &mut buffer);
+
+    let capacity = buffer.capacity();
+    buffer.clear();
+    let range = encode_in::<dyn Person>(&person, &mut buffer);
+
+    // Reusing the allocation is the point: the same message encodes to the
+    // same bytes without asking for more room.
+    assert_eq!(buffer.capacity(), capacity);
+    assert_eq!(range, 0..buffer.len());
+    assert_eq!(decode::<dyn Person>(&buffer).unwrap(), person);
 }
 
 #[zerializable(derive(Debug, PartialEq))]
@@ -624,12 +670,12 @@ fn a_length_that_cannot_be_added_to_is_rejected() {
     // A length word is a claim about the buffer rather than a length: the
     // largest one there is names bytes past the end of every buffer, so it has
     // to be rejected before it is added to an offset.
-    let mut writer = Writer::new();
+    let mut encoded = Vec::new();
+    let mut writer = Writer::new(&mut encoded);
     let frame = writer.begin_frame(1);
     writer.begin_entry(&frame, 0);
     writer.write_u64(u64::MAX);
     writer.end_frame(frame);
-    let encoded = writer.finish();
 
     assert_eq!(
         decode::<dyn Person>(&encoded).unwrap_err(),

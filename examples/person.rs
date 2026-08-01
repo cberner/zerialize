@@ -1,4 +1,4 @@
-use crate::Month::{February, May};
+use crate::Month::{February, March, May};
 use zerialize::*;
 
 #[zerializable]
@@ -113,4 +113,26 @@ fn main() {
     let encoded = encode::<dyn Person>(&person);
     let round_trip = decode::<dyn Person>(&encoded).unwrap();
     assert_eq_person(&person, &round_trip);
+
+    // Encoding into a buffer of one's own appends to it, so a single
+    // allocation may carry several messages, or be cleared and reused for the
+    // next one. Each message is decoded from exactly the range it was written
+    // to.
+    let alice = SimplePerson {
+        name: "Alice".to_string(),
+        children: vec![].into(),
+        date_of_birth: DateOfBirth {
+            day: 3,
+            month: March,
+            year: 1985,
+        },
+    };
+
+    let mut buffer = Vec::new();
+    let first = encode_in::<dyn Person>(&person, &mut buffer);
+    let second = encode_in::<dyn Person>(&alice, &mut buffer);
+    assert_eq!(&buffer[first.clone()], encoded.as_slice());
+
+    assert_eq_person(&person, &decode::<dyn Person>(&buffer[first]).unwrap());
+    assert_eq_person(&alice, &decode::<dyn Person>(&buffer[second]).unwrap());
 }

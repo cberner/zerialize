@@ -1844,11 +1844,11 @@ fn generate_schema(schema: &Schema<'_>, derived: Derived) -> TokenStream {
         // single dynamic call to dispatch on, rather than one per field.
         #[doc(hidden)]
         #visibility trait #source {
-            fn __zerialize_encode(&self, __writer: &mut ::zerialize::Writer);
+            fn __zerialize_encode(&self, __writer: &mut ::zerialize::Writer<'_>);
         }
 
         impl<__S: #name> #source for __S {
-            fn __zerialize_encode(&self, __writer: &mut ::zerialize::Writer) {
+            fn __zerialize_encode(&self, __writer: &mut ::zerialize::Writer<'_>) {
                 let __frame = __writer.begin_frame(#slots);
                 #(#encoded)*
                 __writer.end_frame(__frame);
@@ -1887,7 +1887,7 @@ fn generate_schema(schema: &Schema<'_>, derived: Derived) -> TokenStream {
 
             fn encode_source<'src>(
                 __source: &'src Self::Source<'src>,
-                __writer: &mut ::zerialize::Writer,
+                __writer: &mut ::zerialize::Writer<'_>,
             ) {
                 #source::__zerialize_encode(__source, __writer)
             }
@@ -1909,7 +1909,7 @@ fn generate_schema(schema: &Schema<'_>, derived: Derived) -> TokenStream {
 
             fn encode_element<'src>(
                 __source: &'src Self::Source<'src>,
-                __writer: &mut ::zerialize::Writer,
+                __writer: &mut ::zerialize::Writer<'_>,
             ) {
                 <Self as ::zerialize::Zerializable>::encode_source(__source, __writer)
             }
@@ -2418,11 +2418,11 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
         // over.
         #[doc(hidden)]
         #visibility trait #source {
-            fn __zerialize_encode(&self, __writer: &mut ::zerialize::Writer);
+            fn __zerialize_encode(&self, __writer: &mut ::zerialize::Writer<'_>);
         }
 
         impl #generics #source for #encodable {
-            fn __zerialize_encode(&self, __writer: &mut ::zerialize::Writer) {
+            fn __zerialize_encode(&self, __writer: &mut ::zerialize::Writer<'_>) {
                 match self {
                     #(#encoded)*
                 }
@@ -2435,7 +2435,7 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
 
             fn encode_source<'src>(
                 __source: &'src Self::Source<'src>,
-                __writer: &mut ::zerialize::Writer,
+                __writer: &mut ::zerialize::Writer<'_>,
             ) {
                 #source::__zerialize_encode(__source, __writer)
             }
@@ -2462,7 +2462,7 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
 
             fn encode_element<'src>(
                 __source: &'src Self::Source<'src>,
-                __writer: &mut ::zerialize::Writer,
+                __writer: &mut ::zerialize::Writer<'_>,
             ) {
                 <Self as ::zerialize::Zerializable>::encode_source(__source, __writer)
             }
@@ -2951,7 +2951,7 @@ fn generate_value(value: &Value<'_>) -> TokenStream {
 
             fn encode_element<'src>(
                 __source: &'src Self::Source<'src>,
-                __writer: &mut ::zerialize::Writer,
+                __writer: &mut ::zerialize::Writer<'_>,
             ) {
                 let __value = __source;
                 #encode
