@@ -212,6 +212,48 @@
 //! Only an enum that borrows declares a lifetime, so one that does not is named
 //! as it was before: `Shape<dyn Point>`, not `Shape<'_, dyn Point>`.
 //!
+//! A variant may carry a list, which is a parameter of the enum as a nested
+//! schema is, bound by what the list holds. The enum is named with the view of
+//! that list in the parameter's place, because a list is a handle over the
+//! buffer rather than a name:
+//!
+//! ```
+//! # use zerialize::{List, ListView, OwnedList, decode, encode, zerializable};
+//! # #[zerializable]
+//! # trait Point {
+//! #     #[n(0)]
+//! #     fn x(&self) -> i32;
+//! # }
+//! # struct OwnedPoint(i32);
+//! # impl Point for OwnedPoint {
+//! #     fn x(&self) -> i32 {
+//! #         self.0
+//! #     }
+//! # }
+//! #[zerializable]
+//! enum Path<P: List<Item: Point>> {
+//!     #[variant(0)]
+//!     Along(#[n(0)] P),
+//!     #[variant(1)]
+//!     Nowhere,
+//! }
+//!
+//! let points: OwnedList<OwnedPoint> = vec![OwnedPoint(1), OwnedPoint(2)].into();
+//! let along: Path<&OwnedList<OwnedPoint>> = Path::Along(&points);
+//! let bytes = encode::<Path<ListView<'_, dyn Point>>>(&along);
+//! match decode::<Path<ListView<'_, dyn Point>>>(&bytes).unwrap() {
+//!     Path::Along(points) => assert_eq!(points.get(1).unwrap().x(), 2),
+//!     Path::Nowhere => unreachable!(),
+//! }
+//! ```
+//!
+//! What every instantiation of the enum has in common is what its elements are,
+//! which is why a list of messages is bound by the trait declaring them:
+//! `Path<&OwnedList<OwnedPoint>>` holds points, and the list decoding gives
+//! holds views of them. A list an enum carries may not itself hold an enum,
+//! since an enum is a type rather than a trait and so has no bound that names
+//! every instantiation of it; a message may hold that list instead.
+//!
 //! The enum is otherwise an ordinary enum, so what it needs is derived, above
 //! the attribute or below it, bounding the enum's parameters the way a `derive`
 //! does: `Shape<OwnedPoint>` is `Clone` where `OwnedPoint` is.
@@ -259,8 +301,10 @@
 //! so it is printed by an ordinary `#[derive(Debug)]`.
 //!
 //! A message carries an enum by naming it the way its declaration reads, as
-//! `fn shape(&self) -> Shape<impl Point + '_> where Self: Sized`, so a schema is
-//! free to be a tree of messages and choices.
+//! `fn shape(&self) -> Shape<impl Point + '_> where Self: Sized`, and an enum
+//! carries an enum by naming it over its own parameters, as
+//! `Outline(#[n(0)] Shape<P>)`, so a schema is free to be a tree of messages and
+//! choices.
 
 #![forbid(unsafe_code)]
 

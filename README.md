@@ -21,11 +21,14 @@ against the traits, structs, and enums in the codebase, without referencing any 
 
 ### Container types
 * `Option<T>`, over any other supported type
-* `List<T>`, over any other supported type, as a field of a view schema trait
+* `List<T>`, over any other supported type
 
 An optional field is absent on the wire when it is `None`, which is exactly what a reader sees of
 a field the writer did not have, so a field added as an optional one can be read out of messages
 written before it existed.
+
+Containers may contain any primitive, value type, view trait, or view enum. An `Option` may contain
+a list; `Option<Option<T>>`, a list of `Option<T>`, and a list of lists are not supported.
 
 ### Value types
 Value types are copied, and may be structs or enums, without generic parameters. They must implement
@@ -61,6 +64,9 @@ enum Protocol {
 }
 ```
 
+Value types may only contain primitives that are not borrowed, other value types, and an `Option`
+of either. They may not contain `&str`, `&[u8]`, lists, view traits, or view enums.
+
 ### View schema traits
 View traits provide zero copy access to their data. A method that returns an `impl Trait` must be
 guarded with
@@ -86,6 +92,8 @@ trait Person {
 }
 ```
 
+View schema traits may contain any primitive, container type, value type, view trait, or view enum.
+
 ### View enums
 View enums provide zero copy access to view traits behind a generic parameter. Their other fields
 are copied, except `&str` and `&[u8]`, which point into the buffer as a view trait's do.
@@ -108,6 +116,30 @@ An enum with a borrowed field declares the lifetime it points into, and is named
 is named: `Mammal<'_, dyn Person>` is the schema, and decoding it gives
 `Mammal<'buf, PersonView<'buf>>`. An enum that borrows nothing declares no lifetime, and is named
 without one.
+
+A list is a generic parameter as a nested view trait is, bound by what it holds: an element named
+outright as `List<Item = u32>`, or, where the list holds messages, the trait declaring them as
+`List<Item: Person>`.
+```rust
+#[zerializable]
+enum Recipients<'a, P: List<Item: Person>, N: List<Item = &'a str>> {
+    #[variant(0)]
+    Everyone,
+    #[variant(1)]
+    People(#[n(0)] P),
+    #[variant(2)]
+    Addresses(#[n(0)] N),
+}
+```
+A list is named with `ListView` wherever the enum is named:
+`Recipients<'_, ListView<'_, dyn Person>, ListView<'_, str>>` is the schema, and decoding it gives
+`Recipients<'buf, ListView<'buf, dyn Person>, ListView<'buf, str>>`.
+
+A nested view enum is written over the enum's own parameters: an enum with a `P: Person` parameter
+carries the one above as `Pet(#[n(0)] Mammal<'a, P>)`.
+
+View enums may contain any primitive, container type, value type, view trait, or view enum, with one
+exception: a list a view enum carries may not hold a view enum. A view schema trait's list may.
 
 ## License
 
