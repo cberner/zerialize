@@ -31,6 +31,21 @@ pub trait List {
     }
 }
 
+// Implemented for the reference so that a list may be handed out borrowed, as a
+// schema may: a variant carrying a list is borrowed by `as_ref` the way one
+// carrying a message is.
+impl<L: List + ?Sized> List for &L {
+    type Item = L::Item;
+
+    fn len(&self) -> usize {
+        L::len(self)
+    }
+
+    fn get(&self, index: usize) -> Option<L::Item> {
+        L::get(self, index)
+    }
+}
+
 pub struct ListIter<'a, L> {
     list: &'a L,
     index: usize,
@@ -59,6 +74,7 @@ impl<L: List> ExactSizeIterator for ListIter<'_, L> {}
 /// What a list of primitives or values holds, it holds by value, so this is
 /// what an implementation storing them, an `OwnedList<u32>`, is handed out
 /// through: `Copied(&self.scores)`.
+#[derive(Clone, Copy, Debug)]
 pub struct Copied<L>(pub L);
 
 impl<'a, T: Copy + 'a, L: List<Item = &'a T>> List for Copied<L> {

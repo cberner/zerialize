@@ -66,23 +66,43 @@ use syn::{
 /// An enum is a choice between messages. Every variant must declare the tag
 /// that names it with `#[variant(N)]`, and every field of a variant the slot it
 /// occupies with `#[n(N)]`. A field is a scalar, `&str`, `&[u8]`, a value type,
-/// one of the enum's parameters, each of which stands for a nested schema and
-/// so must be bound by the trait declaring it, or an `Option` of any of them. A
-/// variant carries nothing, a tuple of fields, or named fields, and is built
-/// and matched the way it was declared. Naming a field changes how the enum
-/// reads rather than what it encodes as, since a slot is what names a field on
-/// the wire.
+/// one of the enum's parameters, each of which stands for a nested schema or a
+/// list and so must be bound by what it stands for, another enum written over
+/// this one's parameters, or an `Option` of any of them. A variant carries
+/// nothing, a tuple of fields, or named fields, and is built and matched the
+/// way it was declared. Naming a field changes how the enum reads rather than
+/// what it encodes as, since a slot is what names a field on the wire.
+///
+/// A parameter bound by `List` is a list the enum carries, and its bound names
+/// what that list holds: `L: List<Item = u32>`, `List<Item = Weight>`,
+/// `List<Item = &'a str>`, and `List<Item = &'a [u8]>` name an element
+/// outright, and `List<Item: Person>` names a list of messages by the trait
+/// declaring them, which is what every instantiation of the enum has in common:
+/// a source's list holds its own elements, and the list decoding gives holds
+/// the views of them. The enum is named with `ListView<'_, ..>` in that
+/// parameter's place, over the schema the list holds:
+/// `Roster<'_, ListView<'_, dyn Person>>` is the schema of
+/// `enum Roster<'a, L: List<Item: Person>>`, and decoding it gives
+/// `Roster<'buf, ListView<'buf, dyn Person>>`.
+///
+/// A list an enum carries may not hold another enum: an enum is a type rather
+/// than a trait, so no bound names every instantiation of one. A message may
+/// hold that list instead, since a message holds its elements rather than
+/// standing for them.
 ///
 /// An enum whose fields borrow declares the lifetime they point into, and is
 /// named with it wherever it is named: `enum Note<'a, P: Person>` with a field
 /// written `&'a str` is `Note<'_, dyn Person>` as a schema, and
 /// `Note<'buf, PersonView<'buf>>` once decoded. Only an enum that borrows
-/// declares one, so an enum that does not is named exactly as before.
+/// declares one, so an enum that does not is named exactly as before. A list of
+/// `&str` or `&[u8]` is written in terms of that lifetime as a field of one is,
+/// and a list of anything else keeps the buffer it borrows from to itself.
 ///
 /// The macro generates, from the enum:
 ///
-/// * the enum itself, with every parameter rewritten so that it may be either
-///   an implementation of the schema it carries or the name of that schema,
+/// * the enum itself, with every parameter carrying a schema rewritten so that
+///   it may be either an implementation of that schema or the name of it, and
+///   every parameter carrying a list left standing for the list itself,
 /// * `impl Zerializable for Enum<dyn Trait, ..>`, which is how the enum over
 ///   the names of the schemas it carries comes to name a schema itself,
 /// * `as_ref`, which borrows what every variant carries, so that a message
@@ -113,8 +133,9 @@ use syn::{
 /// compared against itself.
 ///
 /// A message carries an enum by naming it the way its declaration reads,
-/// `fn role(&self) -> Worker<impl Person + '_> where Self: Sized`, so a schema
-/// is free to be a tree of messages and choices.
+/// `fn role(&self) -> Worker<impl Person + '_> where Self: Sized`, and an enum
+/// carries an enum the same way, written over its own parameters rather than
+/// over `impl Trait`, so a schema is free to be a tree of messages and choices.
 ///
 /// A variant's fields are its own, so two variants may use the same slots, and
 /// a field added to a variant is skipped by a reader built against the older
@@ -395,13 +416,24 @@ struct Choice<'a> {
     variants: Vec<Case<'a>>,
 }
 
-/// One parameter of an enum, standing for a schema its variants carry.
-#[derive(Clone, Copy)]
+/// One parameter of an enum, standing for a schema its variants carry, or for a
+/// list of one.
+#[derive(Clone)]
 struct Param<'a> {
     name: &'a Ident,
-    /// The trait the parameter is bound by, which names the schema its values
-    /// are encoded as.
-    schema: &'a Path,
+    carried: Carried<'a>,
+}
+
+/// What a parameter stands for, which is what its bound names.
+#[derive(Clone)]
+enum Carried<'a> {
+    /// A message, named by the trait declaring it.
+    Message(&'a Path),
+    /// A list, named by the schema its `Item` holds. A list is a handle over
+    /// the buffer as a `&str` is, so the parameter stands for one of three
+    /// things: the source's own list, `ListView` where the enum is named, and
+    /// `ListView` over the buffer once it is decoded.
+    List(Kind<'a>),
 }
 
 struct Case<'a> {
@@ -466,6 +498,11 @@ enum Payload<'a> {
     Value(&'a Path),
     /// A nested message, carried by one of the enum's parameters.
     Nested(Param<'a>),
+    /// A nested enum, carried as itself: its payload is written in terms of
+    /// this enum's parameters, so one declaration instantiates with the other.
+    Choice(&'a TypePath),
+    /// A list, carried by one of the enum's parameters.
+    Repeated(Param<'a>),
     /// A field that may be absent, written as `Option<..>`.
     Optional(Box<Payload<'a>>),
 }
@@ -479,6 +516,7 @@ struct Method<'a> {
     kind: Kind<'a>,
 }
 
+#[derive(Clone)]
 enum Kind<'a> {
     Str,
     Bytes,
@@ -526,6 +564,67 @@ fn view_of(nested: Nested<'_>) -> TokenStream {
     quote!(<#schema as ::zerialize::Zerializable>::View<'buf>)
 }
 
+/// The schema a parameter stands for, over `lifetime` where it needs one: a
+/// message by the name of the trait declaring it, and a list by the view of it,
+/// since a list is a handle over the buffer as a `&str` is.
+fn param_schema(param: &Param<'_>, lifetime: &TokenStream) -> TokenStream {
+    match &param.carried {
+        Carried::Message(schema) => schema_of(Nested::Message(schema)),
+        Carried::List(item) => {
+            let element = element_of(item);
+            quote!(::zerialize::ListView<#lifetime, #element>)
+        }
+    }
+}
+
+/// What a parameter stands for once the enum is decoded.
+fn param_view(param: &Param<'_>) -> TokenStream {
+    match &param.carried {
+        Carried::Message(schema) => view_of(Nested::Message(schema)),
+        Carried::List(item) => {
+            let element = element_of(item);
+            quote!(::zerialize::ListView<'buf, #element>)
+        }
+    }
+}
+
+/// The bound a parameter is declared with, which every instantiation of the enum
+/// satisfies: an implementation of the schema it stands for, the name of that
+/// schema, and the view decoding gives.
+fn param_bound(param: &Param<'_>, lifetime: Option<&TokenStream>) -> TokenStream {
+    match &param.carried {
+        Carried::Message(schema) => quote!(#schema),
+        Carried::List(item) => {
+            let held = held_bound(item, lifetime);
+            quote!(::zerialize::List<#held>)
+        }
+    }
+}
+
+/// How the `Item` of a list is bound: by what it is where an element is named
+/// outright, and by the trait its elements implement where they are messages,
+/// since `Item` is sized and the name of a message is not. A list of messages is
+/// therefore bound alike wherever the enum is named, holding the source's own
+/// elements where it holds a list and the views of them where it was decoded.
+fn held_bound(item: &Kind<'_>, lifetime: Option<&TokenStream>) -> TokenStream {
+    match item {
+        Kind::Str => quote!(Item = &#lifetime ::core::primitive::str),
+        Kind::Bytes => quote!(Item = &#lifetime [::core::primitive::u8]),
+        Kind::Scalar(scalar) => quote!(Item = #scalar),
+        Kind::Value(path) => quote!(Item = #path),
+        Kind::Nested(Nested::Message(schema)) => quote!(Item: #schema),
+        Kind::Nested(Nested::Choice(_)) | Kind::Optional(_) | Kind::Repeated(_) => {
+            unreachable!("a list an enum carries holds none of these")
+        }
+    }
+}
+
+/// Whether a parameter carries a list, which the enum holds as it stands rather
+/// than as a name, and which is why the schema is named over a lifetime.
+fn is_list(param: &Param<'_>) -> bool {
+    matches!(param.carried, Carried::List(_))
+}
+
 /// The enum with each schema it carries, written as `impl Trait + '_` where the
 /// method returns it, named as `Zerializable` implements it.
 fn carried_schemas(path: &TypePath) -> TypePath {
@@ -540,8 +639,16 @@ fn carried_schemas(path: &TypePath) -> TypePath {
                     if let Type::ImplTrait(carried) = ty
                         && let Ok(bound) = trait_bound(carried)
                     {
-                        let schema = &bound.path;
-                        *ty = parse_quote!((dyn #schema + 'static));
+                        *ty = match carried_list(bound) {
+                            // A list is named by the view of it, which is what
+                            // the parameter standing for one holds wherever the
+                            // enum is named.
+                            Some(list) => list,
+                            None => {
+                                let schema = &bound.path;
+                                parse_quote!((dyn #schema + 'static))
+                            }
+                        };
                     }
                 }
                 // A schema is a name rather than a buffer, and is named for any
@@ -553,6 +660,22 @@ fn carried_schemas(path: &TypePath) -> TypePath {
         }
     }
     path
+}
+
+/// The list `impl List<Item = ..>` names, where that is what a bound names.
+fn carried_list(bound: &TraitBound) -> Option<Type> {
+    let segment = bound.path.segments.last()?;
+    if segment.ident != "List" {
+        return None;
+    }
+    // An element is named the way a method returning one names it, or by the
+    // trait it implements, which is how the parameter carrying the list names
+    // the messages it holds.
+    let item = parse_list_item(segment)
+        .or_else(|_| parse_carried_item(segment))
+        .ok()?;
+    let element = element_of(&item);
+    Some(parse_quote!(::zerialize::ListView<'static, #element>))
 }
 
 /// Whether an enum is returned carrying schemas, which is what makes the return
@@ -916,17 +1039,112 @@ fn parse_list_item(list: &PathSegment) -> Result<Kind<'_>, Error> {
             _ => None,
         })
         .ok_or_else(expected)?;
-    // An element is an entry of the list's frame, and an entry holds one thing:
-    // a shorter list is what an absent element is, and a list of lists has no
-    // entry to nest the inner one in.
-    match parse_return_type(item)? {
+    require_one_element(parse_return_type(item)?, item)
+}
+
+/// Parses what the list a parameter carries holds, out of the `List<..>` bound
+/// naming it. An element that is a message is named by the trait declaring it,
+/// `List<Item: Person>`, rather than by the name of that schema: `Item` is
+/// sized, and `dyn Person` is not.
+fn parse_carried_item(list: &PathSegment) -> Result<Kind<'_>, Error> {
+    let expected = || {
+        Error::new_spanned(
+            list,
+            "expected `List<Item = ..>`, naming what the list holds, or \
+             `List<Item: Trait>` where it holds messages",
+        )
+    };
+    let PathArguments::AngleBracketed(arguments) = &list.arguments else {
+        return Err(expected());
+    };
+    for argument in &arguments.args {
+        match argument {
+            GenericArgument::AssocType(item) if item.ident == "Item" => {
+                return require_one_element(parse_item(&item.ty)?, &item.ty);
+            }
+            // A message is bound by the trait declaring it, which is what every
+            // instantiation of the enum has in common: the source's own
+            // elements implement it, and so do the views decoding gives.
+            GenericArgument::Constraint(item) if item.ident == "Item" => {
+                return match item.bounds.first() {
+                    Some(TypeParamBound::Trait(bound)) if bound.maybe.is_none() => {
+                        Ok(Kind::Nested(Nested::Message(&bound.path)))
+                    }
+                    _ => Err(Error::new_spanned(
+                        item,
+                        "expected the trait a list's messages implement, `Item: Trait`",
+                    )),
+                };
+            }
+            _ => (),
+        }
+    }
+    Err(expected())
+}
+
+/// An element is an entry of the list's frame, and an entry holds one thing: a
+/// shorter list is what an absent element is, and a list of lists has no entry
+/// to nest the inner one in.
+fn require_one_element<'a>(item: Kind<'a>, ty: &Type) -> Result<Kind<'a>, Error> {
+    match item {
         Kind::Optional(_) => Err(Error::new_spanned(
-            item,
+            ty,
             "a list may not hold `Option`: an element that is not there is a \
              shorter list",
         )),
-        Kind::Repeated(_) => Err(Error::new_spanned(item, "a list may not hold lists")),
+        Kind::Repeated(_) => Err(Error::new_spanned(ty, "a list may not hold lists")),
         item => Ok(item),
+    }
+}
+
+/// Parses one element of a list a parameter carries, named there the way a
+/// variant carrying one element would name it.
+fn parse_item(ty: &Type) -> Result<Kind<'_>, Error> {
+    let unsupported = || {
+        Error::new_spanned(
+            ty,
+            "unsupported list item: expected a scalar, a value type, `&str`, or \
+             `&[u8]`, or, where the list holds messages, the trait declaring \
+             them as `Item: Trait`",
+        )
+    };
+
+    match ty {
+        Type::Reference(reference) if reference.mutability.is_none() => match &*reference.elem {
+            Type::Path(path) if named(path).is_some_and(|name| name == "str") => Ok(Kind::Str),
+            Type::Slice(slice) => match &*slice.elem {
+                Type::Path(path) if named(path).is_some_and(|name| name == "u8") => Ok(Kind::Bytes),
+                _ => Err(unsupported()),
+            },
+            _ => Err(unsupported()),
+        },
+        // A schema is a name rather than a type, so it is not what a list holds:
+        // what every instantiation of the enum holds is something implementing
+        // it, which is what the trait bound below says.
+        Type::TraitObject(_) => Err(Error::new_spanned(
+            ty,
+            "a list of messages is named by the trait declaring them, \
+             `List<Item: Trait>`: the name of a schema is not a type an element \
+             can be",
+        )),
+        Type::Path(path) if optional(path).is_some() => Ok(Kind::Optional(Box::new(parse_item(
+            optional(path).expect("the path names an Option"),
+        )?))),
+        // An enum is a type rather than a trait, so there is nothing to bound
+        // `Item` by that every instantiation of it satisfies. A message may hold
+        // the list instead, which holds its elements rather than standing for
+        // them.
+        Type::Path(path) if names_a_choice(path) => Err(Error::new_spanned(
+            ty,
+            "a list a variant carries may not hold an enum: an enum is a type \
+             rather than a trait, so no bound names every instantiation of one. \
+             A view schema trait's list may hold one",
+        )),
+        Type::Path(path) if path.qself.is_none() => Ok(match scalar(path) {
+            Some(scalar) => Kind::Scalar(scalar),
+            None => Kind::Value(&path.path),
+        }),
+        _ => Err(unsupported()),
     }
 }
 
@@ -959,7 +1177,7 @@ fn parse_choice(item: &ItemEnum) -> Result<Choice<'_>, Error> {
                      every borrowed field of it points into",
                 ));
             }
-            _ => params.push(parse_param(param)?),
+            _ => params.push(parse_param(param, lifetime.is_some())?),
         }
     }
 
@@ -1012,14 +1230,14 @@ fn parse_choice(item: &ItemEnum) -> Result<Choice<'_>, Error> {
     })
 }
 
-/// Parses one parameter of an enum, which stands for a schema and so must name
-/// the trait declaring it.
-fn parse_param(param: &GenericParam) -> Result<Param<'_>, Error> {
+/// Parses one parameter of an enum, which stands for a schema or for a list of
+/// one, and so must name the trait declaring it or what the list holds.
+fn parse_param(param: &GenericParam, borrows: bool) -> Result<Param<'_>, Error> {
     let GenericParam::Type(param) = param else {
         return Err(Error::new_spanned(
             param,
-            "#[zerializable] enums may only be generic over the schemas they carry, \
-             beside the one lifetime their borrowed fields point into",
+            "#[zerializable] enums may only be generic over the schemas and lists they \
+             carry, beside the one lifetime their borrowed fields point into",
         ));
     };
     if let Some((_, default)) = &param.default {
@@ -1029,20 +1247,46 @@ fn parse_param(param: &GenericParam) -> Result<Param<'_>, Error> {
         ));
     }
     let mut bounds = param.bounds.iter();
-    let schema = match (bounds.next(), bounds.next()) {
-        (Some(TypeParamBound::Trait(bound)), None) if bound.maybe.is_none() => &bound.path,
+    let bound = match (bounds.next(), bounds.next()) {
+        (Some(TypeParamBound::Trait(bound)), None) if bound.maybe.is_none() => bound,
         _ => {
             return Err(Error::new_spanned(
                 param,
                 "every #[zerializable] parameter must be bound by exactly one trait, \
-                 naming the schema it carries",
+                 naming the schema it carries or, as `List<Item = ..>`, what the \
+                 list it carries holds",
             ));
         }
     };
+    let segment = bound
+        .path
+        .segments
+        .last()
+        .expect("a path has at least one segment");
+    let carried = if segment.ident == "List" {
+        let item = parse_carried_item(segment)?;
+        if !borrows && borrowed_item(&item) {
+            return Err(Error::new_spanned(
+                segment,
+                "a list of borrowed elements needs the enum to declare the lifetime they \
+                 point into, `enum Name<'a, ..>`, and to name them as `&'a str` or \
+                 `&'a [u8]`",
+            ));
+        }
+        Carried::List(item)
+    } else {
+        Carried::Message(&bound.path)
+    };
     Ok(Param {
         name: &param.ident,
-        schema,
+        carried,
     })
+}
+
+/// Whether the elements of a list point into the buffer, which is what the
+/// enum's lifetime stands for.
+fn borrowed_item(item: &Kind<'_>) -> bool {
+    matches!(item, Kind::Str | Kind::Bytes)
 }
 
 /// Parses one variant, given the variants of the same enum already parsed,
@@ -1127,8 +1371,8 @@ fn parse_payload<'a>(
         Error::new_spanned(
             ty,
             "unsupported field type: expected a scalar, `&str`, `&[u8]`, a value \
-             type, a parameter naming the schema the field carries, or an \
-             `Option` of any of them",
+             type, a parameter naming the schema or the list the field carries, \
+             an enum over those parameters, or an `Option` of any of them",
         )
     };
 
@@ -1169,9 +1413,19 @@ fn parse_payload<'a>(
     if path.qself.is_some() {
         return Err(unsupported());
     }
+    // A path carrying schemas is one declared as an enum, carried as itself:
+    // written over this enum's parameters, it instantiates wherever this one
+    // does, and so is a value here, a name where this enum is named, and a view
+    // of the buffer once this one is decoded.
+    if names_a_choice(path) {
+        return Ok(Payload::Choice(path));
+    }
     let name = named(path).ok_or_else(unsupported)?;
     if let Some(param) = params.iter().find(|param| param.name == name) {
-        Ok(Payload::Nested(*param))
+        Ok(match param.carried {
+            Carried::Message(_) => Payload::Nested(param.clone()),
+            Carried::List(_) => Payload::Repeated(param.clone()),
+        })
     } else if SCALARS.iter().any(|scalar| name == scalar) {
         Ok(Payload::Scalar(name))
     // Anything else named outright is a value, exactly as it is where a method
@@ -1380,20 +1634,7 @@ fn check_field(kind: &Kind<'_>, slot: u32) -> TokenStream {
 /// Statements that return `false` from a comparison where the two sides differ.
 fn compare_field(kind: &Kind<'_>, mine: &TokenStream, theirs: &TokenStream) -> TokenStream {
     match kind {
-        Kind::Repeated(_) => quote! {
-            let __mine = #mine;
-            let __theirs = #theirs;
-            if ::zerialize::List::len(&__mine) != ::zerialize::List::len(&__theirs) {
-                return false;
-            }
-            for (__left, __right) in
-                ::zerialize::List::iter(&__mine).zip(::zerialize::List::iter(&__theirs))
-            {
-                if __left != __right {
-                    return false;
-                }
-            }
-        },
+        Kind::Repeated(_) => compare_lists(mine, theirs),
         Kind::Optional(inner) => {
             let compared = compare_field(inner, &quote!(__some), &quote!(__other));
             quote! {
@@ -1414,6 +1655,27 @@ fn compare_field(kind: &Kind<'_>, mine: &TokenStream, theirs: &TokenStream) -> T
                 return false;
             }
         },
+    }
+}
+
+/// Statements that return `false` where two lists differ, which is where they
+/// hold different numbers of elements or any pair of them differs. The two
+/// sides hold their own elements, so this is a comparison across whatever each
+/// was decoded or built from.
+fn compare_lists(mine: &TokenStream, theirs: &TokenStream) -> TokenStream {
+    quote! {
+        let __mine = #mine;
+        let __theirs = #theirs;
+        if ::zerialize::List::len(&__mine) != ::zerialize::List::len(&__theirs) {
+            return false;
+        }
+        for (__left, __right) in
+            ::zerialize::List::iter(&__mine).zip(::zerialize::List::iter(&__theirs))
+        {
+            if __left != __right {
+                return false;
+            }
+        }
     }
 }
 
@@ -1626,17 +1888,26 @@ fn generate_schema(schema: &Schema<'_>, derived: Derived) -> TokenStream {
 /// frame `frame` marks, given the binding its field was matched to.
 fn write_payload(
     payload: &Payload<'_>,
+    params: &[Param<'_>],
     frame: &Ident,
     slot: u32,
     binding: &TokenStream,
 ) -> TokenStream {
     if let Payload::Optional(inner) = payload {
-        let written = write_payload(inner, frame, slot, &quote!(__some));
+        let written = write_payload(inner, params, frame, slot, &quote!(__some));
         return quote! {
             if let ::core::option::Option::Some(__some) = #binding {
                 #written
             }
         };
+    }
+
+    // A list is a frame of its own wherever it is held, so a variant carrying
+    // one writes it exactly as a message holding one does.
+    if let Payload::Repeated(param) = payload {
+        let item = carried_item(param).clone();
+        let entry = entry_of(slot);
+        return write_field(&Kind::Repeated(Box::new(item)), frame, &entry, binding);
     }
 
     let entry = Literal::usize_suffixed(slot as usize);
@@ -1651,11 +1922,18 @@ fn write_payload(
             <#path as ::zerialize::Value>::encode_value(#binding, __writer);
         },
         Payload::Nested(carried) => {
-            let schema = schema_of(Nested::Message(carried.schema));
+            let schema = carried_schema(carried);
             quote! {
                 <#schema as ::zerialize::Zerializable>::encode_source(#binding, __writer);
             }
         }
+        Payload::Choice(path) => {
+            let schema = choice_schema(path, params);
+            quote! {
+                <#schema as ::zerialize::Zerializable>::encode_source(#binding, __writer);
+            }
+        }
+        Payload::Repeated(_) => unreachable!("a list is written above"),
         Payload::Optional(_) => unreachable!("an optional field is written above"),
     };
     quote! {
@@ -1664,9 +1942,54 @@ fn write_payload(
     }
 }
 
+/// The schema a parameter carrying a message stands for.
+fn carried_schema(param: &Param<'_>) -> TokenStream {
+    let Carried::Message(schema) = &param.carried else {
+        unreachable!("a nested field carries a message");
+    };
+    schema_of(Nested::Message(schema))
+}
+
+/// What the list a parameter carries holds.
+fn carried_item<'a>(param: &'a Param<'_>) -> &'a Kind<'a> {
+    let Carried::List(item) = &param.carried else {
+        unreachable!("a repeated field carries a list");
+    };
+    item
+}
+
+/// The schema a nested enum names, which is that enum over the schemas this
+/// one's parameters stand for: a field written `Reachable<P>` is carried as
+/// itself, and named `Reachable<dyn Person>`.
+fn choice_schema(path: &TypePath, params: &[Param<'_>]) -> TokenStream {
+    let mut path = path.clone();
+    if let Some(segment) = path.path.segments.last_mut()
+        && let PathArguments::AngleBracketed(arguments) = &mut segment.arguments
+    {
+        for argument in &mut arguments.args {
+            match argument {
+                GenericArgument::Type(ty) => {
+                    if let Type::Path(carried) = ty
+                        && let Some(name) = named(carried)
+                        && let Some(param) = params.iter().find(|param| param.name == name)
+                    {
+                        let schema = param_schema(param, &quote!('static));
+                        *ty = parse_quote!(#schema);
+                    }
+                }
+                // A schema is a name rather than a buffer, and is named for any
+                // lifetime, exactly as the enum holding it is.
+                GenericArgument::Lifetime(lifetime) => *lifetime = parse_quote!('static),
+                _ => (),
+            }
+        }
+    }
+    path.into_token_stream()
+}
+
 /// Reads what a variant carries out of `__payload`, which is where reading a
 /// choice is checked: the fields of the variant its tag named.
-fn read_payload(payload: &Payload<'_>, slot: u32) -> TokenStream {
+fn read_payload(payload: &Payload<'_>, params: &[Param<'_>], slot: u32) -> TokenStream {
     let entry = Literal::u32_suffixed(slot);
     match payload {
         Payload::Scalar(scalar) => {
@@ -1679,15 +2002,27 @@ fn read_payload(payload: &Payload<'_>, slot: u32) -> TokenStream {
             quote!(<#path as ::zerialize::Value>::decode_value(__payload, #entry)?)
         }
         Payload::Nested(carried) => {
-            let schema = schema_of(Nested::Message(carried.schema));
+            let schema = carried_schema(carried);
             quote! {
                 <#schema as ::zerialize::Zerializable>::decode_view(
                     __payload.read_message(#entry)?,
                 )?
             }
         }
+        Payload::Choice(path) => {
+            let schema = choice_schema(path, params);
+            quote! {
+                <#schema as ::zerialize::Zerializable>::decode_view(
+                    __payload.read_message(#entry)?,
+                )?
+            }
+        }
+        Payload::Repeated(param) => {
+            let element = element_of(carried_item(param));
+            quote!(__payload.read_list::<#element>(#entry)?)
+        }
         Payload::Optional(inner) => {
-            let read = read_payload(inner, slot);
+            let read = read_payload(inner, params, slot);
             quote! {
                 if __payload.is_present(#entry)? {
                     ::core::option::Option::Some(#read)
@@ -1699,8 +2034,8 @@ fn read_payload(payload: &Payload<'_>, slot: u32) -> TokenStream {
     }
 }
 
-/// What a matched field is handed out as by `as_ref`: a message is borrowed,
-/// and a scalar, which is carried by value, is copied.
+/// What a matched field is handed out as by `as_ref`: a message and a list are
+/// borrowed, and a scalar, which is carried by value, is copied.
 fn borrow_payload(payload: &Payload<'_>, binding: &TokenStream) -> TokenStream {
     match payload {
         // A scalar and a value are carried by value, and a borrowed field is
@@ -1709,9 +2044,20 @@ fn borrow_payload(payload: &Payload<'_>, binding: &TokenStream) -> TokenStream {
         Payload::Scalar(_) | Payload::Str | Payload::Bytes | Payload::Value(_) => {
             quote!(*#binding)
         }
-        Payload::Nested(_) => quote!(#binding),
+        Payload::Nested(_) | Payload::Repeated(_) => quote!(#binding),
+        // A nested enum hands out what it carries the same way, which is what
+        // makes the enum holding it one over references too.
+        Payload::Choice(_) => quote!(#binding.as_ref()),
         Payload::Optional(inner) => match &**inner {
-            Payload::Nested(_) => quote!(::core::option::Option::as_ref(#binding)),
+            Payload::Nested(_) | Payload::Repeated(_) => {
+                quote!(::core::option::Option::as_ref(#binding))
+            }
+            Payload::Choice(_) => quote! {
+                ::core::option::Option::map(
+                    ::core::option::Option::as_ref(#binding),
+                    |__nested| __nested.as_ref(),
+                )
+            },
             _ => quote!(*#binding),
         },
     }
@@ -1720,6 +2066,10 @@ fn borrow_payload(payload: &Payload<'_>, binding: &TokenStream) -> TokenStream {
 /// Statements that return `false` from a comparison where the two sides differ.
 fn compare_payload(payload: &Payload<'_>, mine: &TokenStream, theirs: &TokenStream) -> TokenStream {
     match payload {
+        // A list is compared element by element, as the same list is where a
+        // message holds one: the two sides hold their own elements, which are
+        // only compared against each other.
+        Payload::Repeated(_) => compare_lists(mine, theirs),
         Payload::Optional(inner) => {
             let compared = compare_payload(inner, &quote!(__some), &quote!(__other));
             quote! {
@@ -1748,10 +2098,24 @@ fn compare_payload(payload: &Payload<'_>, mine: &TokenStream, theirs: &TokenStre
 /// would not use.
 fn carries(payload: &Payload<'_>, param: &Param<'_>) -> bool {
     match payload {
-        Payload::Nested(by) => by.name == param.name,
+        Payload::Nested(by) | Payload::Repeated(by) => by.name == param.name,
+        // A nested enum is written over this one's parameters, so it carries
+        // whichever of them it is named with.
+        Payload::Choice(path) => carried_by(path, param),
         Payload::Optional(inner) => carries(inner, param),
         Payload::Scalar(_) | Payload::Str | Payload::Bytes | Payload::Value(_) => false,
     }
+}
+
+/// Whether a nested enum is named with `param`.
+fn carried_by(path: &TypePath, param: &Param<'_>) -> bool {
+    path.path.segments.last().is_some_and(|segment| {
+        matches!(&segment.arguments, PathArguments::AngleBracketed(arguments)
+        if arguments.args.iter().any(|argument| {
+            matches!(argument, GenericArgument::Type(Type::Path(carried))
+                if named(carried).is_some_and(|name| name == param.name))
+        }))
+    })
 }
 
 /// Whether a field points into the buffer, which is what the enum's lifetime
@@ -1759,9 +2123,26 @@ fn carries(payload: &Payload<'_>, param: &Param<'_>) -> bool {
 fn borrows(payload: &Payload<'_>) -> bool {
     match payload {
         Payload::Str | Payload::Bytes => true,
+        // A list is bound by what it holds, so it is written in terms of the
+        // enum's lifetime exactly where its elements point into the buffer.
+        Payload::Repeated(param) => borrowed_item(carried_item(param)),
+        // A nested enum is named with the lifetime it borrows from, which is
+        // the one the enum holding it declares.
+        Payload::Choice(path) => borrows_from_a_lifetime(path),
         Payload::Optional(inner) => borrows(inner),
         Payload::Scalar(_) | Payload::Value(_) | Payload::Nested(_) => false,
     }
+}
+
+/// Whether a nested enum is named with a lifetime, which is what an enum that
+/// borrows is named with.
+fn borrows_from_a_lifetime(path: &TypePath) -> bool {
+    path.path.segments.last().is_some_and(|segment| {
+        matches!(&segment.arguments, PathArguments::AngleBracketed(arguments)
+        if arguments.args.iter().any(|argument| {
+            matches!(argument, GenericArgument::Lifetime(_))
+        }))
+    })
 }
 
 /// The enum instantiated over `lifetime` and `arguments`, which is the enum
@@ -1788,7 +2169,6 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
         variants,
     } = parsed;
     let source = format_ident!("__{}Source", name);
-    let declaration = declaration(item, params);
 
     // An enum that borrows is written in terms of the lifetime it declares, so
     // every instantiation below gives that lifetime whatever it stands for
@@ -1797,6 +2177,7 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
     let declared = lifetime.map(|lifetime| quote!(#lifetime));
     let buffer = lifetime.map(|_| quote!('buf));
     let named = lifetime.map(|_| quote!('__schema));
+    let declaration = declaration(item, params, declared.as_ref());
 
     // The enum is instantiated three ways: over implementations of the schemas
     // it carries, which is what an encodable value is; over the names of those
@@ -1805,8 +2186,9 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
     let bounds = params
         .iter()
         .map(|param| {
-            let (name, schema) = (param.name, param.schema);
-            quote!(#name: #schema)
+            let name = param.name;
+            let bound = param_bound(param, declared.as_ref());
+            quote!(#name: #bound)
         })
         .collect::<Vec<_>>();
     let generics = match (&declared, bounds.is_empty()) {
@@ -1818,18 +2200,19 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
     let parameters = params.iter().map(|param| param.name).collect::<Vec<_>>();
     let encodable = instantiate(name, declared.as_ref(), &parameters);
 
+    // A list is a view of the buffer wherever the enum is named, so an enum
+    // carrying one is named for a lifetime whether or not it declares one.
+    let schema_lifetime = quote!('__schema);
     let schemas = params
         .iter()
-        .map(|param| schema_of(Nested::Message(param.schema)))
+        .map(|param| param_schema(param, &schema_lifetime))
         .collect::<Vec<_>>();
     // The schema is named for any lifetime, so that naming it never has to name
     // one: `Enum<'_, dyn Trait>` is the schema wherever it is written.
-    let schema_generics = named.as_ref().map(|named| quote!(<#named>));
+    let schema_generics =
+        (lifetime.is_some() || params.iter().any(is_list)).then(|| quote!(<#schema_lifetime>));
     let schema = instantiate(name, named.as_ref(), &schemas);
-    let views = params
-        .iter()
-        .map(|param| view_of(Nested::Message(param.schema)))
-        .collect::<Vec<_>>();
+    let views = params.iter().map(param_view).collect::<Vec<_>>();
     let view = instantiate(name, buffer.as_ref(), &views);
 
     let encoded = variants.iter().map(|variant| {
@@ -1842,7 +2225,13 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
             let frame = format_ident!("__payload");
             let written = variant.fields.iter().enumerate().map(|(index, field)| {
                 let binding = binding("__field", index);
-                write_payload(&field.payload, &frame, field.slot, &quote!(#binding))
+                write_payload(
+                    &field.payload,
+                    params,
+                    &frame,
+                    field.slot,
+                    &quote!(#binding),
+                )
             });
             quote! {
                 let __payload = __writer.begin_payload(&__frame, #slots);
@@ -1864,7 +2253,7 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
         let read = variant
             .fields
             .iter()
-            .map(|field| read_payload(&field.payload, field.slot))
+            .map(|field| read_payload(&field.payload, params, field.slot))
             .collect::<Vec<_>>();
         let built = construct(name, &variant.written, &read);
         // A variant carrying nothing was written without a payload, so there is
@@ -1894,8 +2283,20 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
     let other_lifetime = lifetime.map(|_| quote!('__other));
     let compared_generics = {
         let bounds = params.iter().zip(&others).map(|(param, other)| {
-            let (name, schema) = (param.name, param.schema);
-            quote!(#name: #schema + ::core::cmp::PartialEq<#other>, #other: #schema)
+            let name = param.name;
+            let bound = param_bound(param, declared.as_ref());
+            match &param.carried {
+                Carried::Message(_) => {
+                    quote!(#name: #bound + ::core::cmp::PartialEq<#other>, #other: #bound)
+                }
+                // Two lists are compared element by element, so what each side
+                // is bound by is its own elements: the comparison between them
+                // is a bound on those, below.
+                Carried::List(_) => {
+                    let other_bound = param_bound(param, other_lifetime.as_ref());
+                    quote!(#name: #bound, #other: #other_bound)
+                }
+            }
         });
         let lifetimes = declared.iter().chain(other_lifetime.iter());
         let bounds = lifetimes
@@ -1908,6 +2309,22 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
             quote!(<#(#bounds),*>)
         }
     };
+    // What a list holds is only known to be comparable where it is asked for,
+    // because a list is bound by what it holds rather than by the schema of it.
+    let compared_elements = params
+        .iter()
+        .zip(&others)
+        .filter(|(param, _)| is_list(param))
+        .map(|(param, other)| {
+            let name = param.name;
+            quote! {
+                <#name as ::zerialize::List>::Item:
+                    ::core::cmp::PartialEq<<#other as ::zerialize::List>::Item>,
+            }
+        })
+        .collect::<Vec<_>>();
+    let compared_where =
+        (!compared_elements.is_empty()).then(|| quote!(where #(#compared_elements)*));
     let compared_to = instantiate(name, other_lifetime.as_ref(), &others);
 
     // The enum over references to what it carries. A message hands out an enum
@@ -1965,7 +2382,9 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
             TokenStream::new()
         };
         quote! {
-            impl #compared_generics ::core::cmp::PartialEq<#compared_to> for #encodable {
+            impl #compared_generics ::core::cmp::PartialEq<#compared_to> for #encodable
+            #compared_where
+            {
                 fn eq(&self, __other: &#compared_to) -> bool {
                     match (self, __other) {
                         #(#arms)*
@@ -2048,13 +2467,34 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
 /// The enum as it was declared, with every parameter rewritten to stand for
 /// what its variants carry: an implementation stands for itself, and the name
 /// of a schema for nothing that can be constructed.
-fn declaration(item: &ItemEnum, params: &[Param<'_>]) -> TokenStream {
+///
+/// A parameter carrying a list stands for the list itself, since the list a
+/// view holds is a handle over the buffer rather than a name, so its bound is
+/// rewritten instead: what every instantiation has in common is what its
+/// elements are, which is what [`held_bound`] says.
+fn declaration(
+    item: &ItemEnum,
+    params: &[Param<'_>],
+    lifetime: Option<&TokenStream>,
+) -> TokenStream {
     let mut item = item.clone();
     strip_variant_attributes(&mut item);
-    for param in &mut item.generics.params {
-        if let GenericParam::Type(param) = param {
-            param.bounds.push(parse_quote!(::zerialize::SchemaArg));
-            param.bounds.push(parse_quote!(?Sized));
+    for declared in &mut item.generics.params {
+        let GenericParam::Type(declared) = declared else {
+            continue;
+        };
+        let Some(param) = params.iter().find(|param| *param.name == declared.ident) else {
+            continue;
+        };
+        match &param.carried {
+            Carried::Message(_) => {
+                declared.bounds.push(parse_quote!(::zerialize::SchemaArg));
+                declared.bounds.push(parse_quote!(?Sized));
+            }
+            Carried::List(_) => {
+                let bound = param_bound(param, lifetime);
+                declared.bounds = parse_quote!(#bound);
+            }
         }
     }
     for variant in &mut item.variants {
@@ -2078,7 +2518,13 @@ fn carried_type(ty: &Type, params: &[Param<'_>]) -> Option<Type> {
         return Some(parse_quote!(::core::option::Option<#inner>));
     }
     let name = named(path)?;
-    let carried = params.iter().find(|param| param.name == name)?.name;
+    let param = params.iter().find(|param| param.name == name)?;
+    // A list is held as itself: what the enum is instantiated over is the list,
+    // and it is only the schema it carries that a name stands in for.
+    if is_list(param) {
+        return None;
+    }
+    let carried = param.name;
     Some(parse_quote!(<#carried as ::zerialize::SchemaArg>::Value))
 }
 

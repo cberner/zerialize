@@ -2,7 +2,9 @@
 //! places a type may appear: the fields of a message, the fields of a value,
 //! and the fields of a choice's variant.
 
-use zerialize::{Copied, Error, List, OwnedList, Zerializable, decode, encode, zerializable};
+use zerialize::{
+    Copied, Error, List, ListView, OwnedList, Zerializable, decode, encode, zerializable,
+};
 
 // ============================================================
 // Schemas the sections below share
@@ -1070,6 +1072,7 @@ struct OwnedInventory {
 
 /// A list of what an implementation stores as `String`s and `Vec`s, handed out
 /// as the handles a list of them holds.
+#[derive(Debug)]
 struct Borrowed<'a, T>(&'a [T]);
 
 impl<'a> List for Borrowed<'a, String> {
@@ -1772,4 +1775,414 @@ fn a_choices_variant_that_gains_its_first_field_carries_an_absent_one() {
         .unwrap(),
         signal_before::Signal::Lower
     );
+}
+
+// ============================================================
+// A view enum whose variants carry lists
+// ============================================================
+
+/// A view enum carrying one list per kind of element it may hold. A list is
+/// what a parameter stands for, exactly as a message is, so the enum is named
+/// over the view of one wherever it is named: `Roster<'_, dyn Contact,
+/// ListView<'_, dyn Contact>, ..>` is the schema, and decoding it gives the
+/// enum over the lists of the buffer.
+#[zerializable(derive(PartialEq))]
+#[derive(Debug)]
+enum Roster<
+    'a,
+    C: Contact,
+    M: List<Item: Contact>,
+    N: List<Item = &'a str>,
+    S: List<Item = &'a [u8]>,
+    W: List<Item = Weight>,
+    Q: List<Item = u32>,
+> {
+    #[variant(0)]
+    Team(#[n(0)] M),
+    #[variant(1)]
+    Named {
+        #[n(0)]
+        names: N,
+        #[n(1)]
+        seals: S,
+    },
+    #[variant(2)]
+    Weighed(#[n(0)] W, #[n(1)] Option<Q>),
+    #[variant(3)]
+    Counted(#[n(0)] Q),
+    #[variant(4)]
+    Lead(#[n(0)] C),
+    #[variant(5)]
+    Nobody,
+}
+
+/// The enum over what an implementation holds, which is what a list of
+/// messages is handed out as: the elements a source's list holds are its own,
+/// and implement the schema they are encoded as.
+type OwnedRoster<'a> = Roster<
+    'a,
+    &'a OwnedContact,
+    &'a OwnedList<OwnedContact>,
+    Borrowed<'a, String>,
+    Borrowed<'a, Vec<u8>>,
+    Copied<&'a OwnedList<Weight>>,
+    Copied<&'a OwnedList<u32>>,
+>;
+
+/// The enum over the names of the schemas and lists it carries, which is the
+/// name of this one.
+type RosterSchema<'a> = Roster<
+    'a,
+    dyn Contact,
+    ListView<'a, dyn Contact>,
+    ListView<'a, str>,
+    ListView<'a, [u8]>,
+    ListView<'a, Weight>,
+    ListView<'a, u32>,
+>;
+
+#[derive(Debug, Default)]
+struct Held {
+    contacts: OwnedList<OwnedContact>,
+    names: Vec<String>,
+    seals: Vec<Vec<u8>>,
+    weights: OwnedList<Weight>,
+    counts: OwnedList<u32>,
+}
+
+impl Held {
+    fn rosters(&self) -> [OwnedRoster<'_>; 7] {
+        [
+            Roster::Team(&self.contacts),
+            Roster::Named {
+                names: Borrowed(&self.names),
+                seals: Borrowed(&self.seals),
+            },
+            Roster::Weighed(Copied(&self.weights), Some(Copied(&self.counts))),
+            Roster::Weighed(Copied(&self.weights), None),
+            Roster::Counted(Copied(&self.counts)),
+            Roster::Lead(&self.contacts.as_slice()[0]),
+            Roster::Nobody,
+        ]
+    }
+}
+
+fn held() -> Held {
+    Held {
+        contacts: vec![
+            OwnedContact("Ada".to_string()),
+            OwnedContact("Grace".to_string()),
+        ]
+        .into(),
+        names: vec!["one".to_string(), String::new()],
+        seals: vec![vec![1, 2], Vec::new()],
+        weights: vec![Weight { grams: 5 }, Weight { grams: 6 }].into(),
+        counts: vec![0, u32::MAX].into(),
+    }
+}
+
+#[test]
+fn a_variant_holds_lists() {
+    let held = held();
+    for source in held.rosters() {
+        let encoded = encode::<RosterSchema<'_>>(&source);
+        let decoded = decode::<RosterSchema<'_>>(&encoded).unwrap();
+
+        // The enum over the lists of the buffer compares against the enum over
+        // the lists it was encoded from, element by element.
+        assert_eq!(decoded, source);
+        assert_eq!(encode::<RosterSchema<'_>>(&decoded), encoded);
+        // An enum an implementation stores is handed out borrowed, which is a
+        // list of its own: a reference to a list is one.
+        assert_eq!(encode::<RosterSchema<'_>>(&source.as_ref()), encoded);
+    }
+
+    let encoded = encode::<RosterSchema<'_>>(&held.rosters()[0]);
+    match decode::<RosterSchema<'_>>(&encoded).unwrap() {
+        Roster::Team(team) => {
+            assert_eq!(team.len(), 2);
+            assert_eq!(team.get(0).unwrap().name(), "Ada");
+            assert_eq!(team.get(1).unwrap().name(), "Grace");
+            assert!(team.get(2).is_none());
+        }
+        _ => panic!("decoded the wrong variant"),
+    }
+
+    let encoded = encode::<RosterSchema<'_>>(&held.rosters()[1]);
+    match decode::<RosterSchema<'_>>(&encoded).unwrap() {
+        Roster::Named { names, seals } => {
+            assert_eq!(names.iter().collect::<Vec<_>>(), ["one", ""]);
+            assert_eq!(seals.get(0).unwrap(), &[1, 2][..]);
+            assert!(seals.get(1).unwrap().is_empty());
+        }
+        _ => panic!("decoded the wrong variant"),
+    }
+
+    let encoded = encode::<RosterSchema<'_>>(&held.rosters()[2]);
+    match decode::<RosterSchema<'_>>(&encoded).unwrap() {
+        Roster::Weighed(weights, counts) => {
+            assert_eq!(weights.get(1).unwrap(), Weight { grams: 6 });
+            assert_eq!(counts.unwrap().iter().collect::<Vec<_>>(), [0, u32::MAX]);
+        }
+        _ => panic!("decoded the wrong variant"),
+    }
+
+    // An absent list is a slot left unwritten, as any absent field is.
+    let encoded = encode::<RosterSchema<'_>>(&held.rosters()[3]);
+    match decode::<RosterSchema<'_>>(&encoded).unwrap() {
+        Roster::Weighed(_, counts) => assert!(counts.is_none()),
+        _ => panic!("decoded the wrong variant"),
+    }
+}
+
+#[test]
+fn an_empty_list_a_variant_holds_round_trips() {
+    let held = Held::default();
+    let empty: [OwnedRoster<'_>; 2] = [
+        Roster::Team(&held.contacts),
+        Roster::Named {
+            names: Borrowed(&held.names),
+            seals: Borrowed(&held.seals),
+        },
+    ];
+    for source in empty {
+        let encoded = encode::<RosterSchema<'_>>(&source);
+        let decoded = decode::<RosterSchema<'_>>(&encoded).unwrap();
+
+        assert_eq!(decoded, source);
+        match decoded {
+            Roster::Team(team) => assert!(team.is_empty()),
+            Roster::Named { names, seals } => {
+                assert!(names.is_empty());
+                assert!(seals.is_empty());
+            }
+            _ => panic!("decoded the wrong variant"),
+        }
+    }
+}
+
+#[test]
+fn an_element_of_a_list_a_variant_holds_points_into_the_buffer() {
+    let held = held();
+    let encoded = encode::<RosterSchema<'_>>(&held.rosters()[1]);
+    let buffer = encoded.as_ptr() as usize..encoded.as_ptr() as usize + encoded.len();
+
+    match decode::<RosterSchema<'_>>(&encoded).unwrap() {
+        Roster::Named { names, seals } => {
+            let name = names.get(0).unwrap();
+            assert!(buffer.contains(&(name.as_ptr() as usize)));
+            let seal = seals.get(0).unwrap();
+            assert!(buffer.contains(&(seal.as_ptr() as usize)));
+        }
+        _ => panic!("decoded the wrong variant"),
+    }
+}
+
+/// A message carrying an enum that carries a list, which names the list the way
+/// the enum's declaration reads.
+#[zerializable(derive(Debug, PartialEq))]
+trait Register {
+    #[n(0)]
+    fn roster(
+        &self,
+    ) -> Roster<
+        '_,
+        impl Contact + '_,
+        impl List<Item: Contact> + '_,
+        impl List<Item = &str> + '_,
+        impl List<Item = &[u8]> + '_,
+        impl List<Item = Weight> + '_,
+        impl List<Item = u32> + '_,
+    >
+    where
+        Self: Sized;
+}
+
+#[derive(Debug)]
+struct OwnedRegister(Held);
+
+impl Register for OwnedRegister {
+    fn roster(
+        &self,
+    ) -> Roster<
+        '_,
+        impl Contact + '_,
+        impl List<Item: Contact> + '_,
+        impl List<Item = &str> + '_,
+        impl List<Item = &[u8]> + '_,
+        impl List<Item = Weight> + '_,
+        impl List<Item = u32> + '_,
+    >
+    where
+        Self: Sized,
+    {
+        let roster: OwnedRoster<'_> = Roster::Team(&self.0.contacts);
+        roster
+    }
+}
+
+#[test]
+fn a_message_carries_an_enum_that_carries_a_list() {
+    let source = OwnedRegister(held());
+    let encoded = encode::<dyn Register>(&source);
+    let view = decode::<dyn Register>(&encoded).unwrap();
+
+    match view.roster() {
+        Roster::Team(team) => assert_eq!(team.get(0).unwrap().name(), "Ada"),
+        _ => panic!("decoded the wrong variant"),
+    }
+    assert_eq!(view, source);
+    assert_eq!(encode::<dyn Register>(&view), encoded);
+}
+
+#[test]
+fn corrupt_enums_carrying_lists_never_panic() {
+    let held = held();
+    for source in held.rosters() {
+        let encoded = encode::<RosterSchema<'_>>(&source);
+        for index in 0..encoded.len() {
+            for bit in [0x01, 0x40, 0x80] {
+                let mut corrupted = encoded.clone();
+                corrupted[index] ^= bit;
+                let Ok(decoded) = decode::<RosterSchema<'_>>(&corrupted) else {
+                    continue;
+                };
+                match decoded {
+                    Roster::Team(team) => {
+                        for contact in team.iter() {
+                            let _ = contact.name();
+                        }
+                    }
+                    Roster::Named { names, seals } => {
+                        for name in names.iter() {
+                            let _ = name;
+                        }
+                        for seal in seals.iter() {
+                            let _ = seal;
+                        }
+                    }
+                    Roster::Weighed(weights, counts) => {
+                        for weight in weights.iter() {
+                            let _ = weight;
+                        }
+                        for count in counts.iter().flat_map(List::iter) {
+                            let _ = count;
+                        }
+                    }
+                    Roster::Counted(counts) => {
+                        for count in counts.iter() {
+                            let _ = count;
+                        }
+                    }
+                    Roster::Lead(contact) => {
+                        let _ = contact.name();
+                    }
+                    Roster::Nobody => (),
+                }
+            }
+        }
+    }
+}
+
+// ============================================================
+// A view enum whose variants carry view enums
+// ============================================================
+
+/// A view enum carrying others, which are written over this one's parameters:
+/// one declaration instantiates wherever the other does, so a nested enum is a
+/// value here, a name where this one is named, and a view of the buffer once
+/// this one is decoded.
+#[zerializable(derive(PartialEq))]
+#[derive(Debug)]
+enum Tagged<'a, C: Contact> {
+    #[variant(0)]
+    Labelled {
+        #[n(0)]
+        label: Label<'a>,
+        #[n(1)]
+        who: Reachable<C>,
+    },
+    #[variant(1)]
+    Maybe(#[n(0)] Option<Reachable<C>>),
+    #[variant(2)]
+    Untagged,
+}
+
+fn tagged(contact: &OwnedContact) -> [Tagged<'_, &OwnedContact>; 6] {
+    [
+        Tagged::Labelled {
+            label: Label::Text("hello"),
+            who: Reachable::By(contact),
+        },
+        Tagged::Labelled {
+            label: Label::None,
+            who: Reachable::Never,
+        },
+        Tagged::Maybe(Some(Reachable::By(contact))),
+        Tagged::Maybe(Some(Reachable::Never)),
+        Tagged::Maybe(None),
+        Tagged::Untagged,
+    ]
+}
+
+#[test]
+fn a_variant_holds_view_enums() {
+    let contact = OwnedContact("Ada".to_string());
+    for source in tagged(&contact) {
+        let encoded = encode::<Tagged<'_, dyn Contact>>(&source);
+        let decoded = decode::<Tagged<'_, dyn Contact>>(&encoded).unwrap();
+
+        assert_eq!(decoded, source);
+        assert_eq!(encode::<Tagged<'_, dyn Contact>>(&decoded), encoded);
+        // A nested enum is handed out borrowed the way it hands out its own
+        // fields, which is what lets one an implementation stores be encoded.
+        assert_eq!(encode::<Tagged<'_, dyn Contact>>(&source.as_ref()), encoded);
+    }
+
+    let encoded = encode::<Tagged<'_, dyn Contact>>(&tagged(&contact)[0]);
+    match decode::<Tagged<'_, dyn Contact>>(&encoded).unwrap() {
+        Tagged::Labelled { label, who } => {
+            assert_eq!(label, Label::Text("hello"));
+            match who {
+                Reachable::By(contact) => assert_eq!(contact.name(), "Ada"),
+                Reachable::Never => panic!("decoded the wrong variant"),
+            }
+        }
+        _ => panic!("decoded the wrong variant"),
+    }
+
+    let encoded = encode::<Tagged<'_, dyn Contact>>(&tagged(&contact)[4]);
+    match decode::<Tagged<'_, dyn Contact>>(&encoded).unwrap() {
+        Tagged::Maybe(who) => assert!(who.is_none()),
+        _ => panic!("decoded the wrong variant"),
+    }
+}
+
+#[test]
+fn corrupt_enums_carrying_enums_never_panic() {
+    let contact = OwnedContact("Ada".to_string());
+    for source in tagged(&contact) {
+        let encoded = encode::<Tagged<'_, dyn Contact>>(&source);
+        for index in 0..encoded.len() {
+            for bit in [0x01, 0x40, 0x80] {
+                let mut corrupted = encoded.clone();
+                corrupted[index] ^= bit;
+                let Ok(decoded) = decode::<Tagged<'_, dyn Contact>>(&corrupted) else {
+                    continue;
+                };
+                match decoded {
+                    Tagged::Labelled { label, who } => {
+                        let _ = label;
+                        if let Reachable::By(contact) = who {
+                            let _ = contact.name();
+                        }
+                    }
+                    Tagged::Maybe(Some(Reachable::By(contact))) => {
+                        let _ = contact.name();
+                    }
+                    Tagged::Maybe(_) | Tagged::Untagged => (),
+                }
+            }
+        }
+    }
 }
