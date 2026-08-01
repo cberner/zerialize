@@ -9,6 +9,7 @@
 //! str    := len: u64, utf8[len]
 //! bytes  := len: u64, byte[len]
 //! scalar := fixed width, little endian
+//! char   := u32, a Unicode scalar value
 //! ```
 //!
 //! An enum is a frame of two entries: the tag naming its variant, and the frame
@@ -23,8 +24,12 @@
 //! can be nothing more than the bytes of its frame. A reader ignores slots it
 //! does not know by never indexing them, so a schema can gain fields without
 //! breaking readers built against the older one.
+//!
+//! An absent entry is also what an optional field encodes `None` as, which is
+//! why a slot a writer never knew about and one it deliberately left out read
+//! alike: a field added as an optional one is readable in both directions.
 
-use crate::{Error, ListView, Zerializable};
+use crate::{Element, Error, ListView};
 
 const WORD: usize = size_of::<u64>();
 
@@ -41,6 +46,20 @@ const MAX_DEPTH: u32 = 64;
 const TAG: u32 = 0;
 const PAYLOAD: u32 = 1;
 const VARIANT_SLOTS: usize = 2;
+
+/// A frame of no entries: a length of exactly its header, and a count of zero.
+///
+/// This is what an absent payload is read as, so that a variant which gained
+/// its first field reads that field as absent rather than as missing.
+static EMPTY_FRAME: [u8; HEADER] = {
+    assert!(
+        HEADER < u8::MAX as usize,
+        "the length is one byte of the header"
+    );
+    let mut bytes = [0; HEADER];
+    bytes[0] = HEADER as u8;
+    bytes
+};
 
 fn read_word(bytes: &[u8], at: usize) -> Result<usize, Error> {
     let end = at.checked_add(WORD).ok_or(Error::UnexpectedEof)?;
@@ -144,15 +163,23 @@ impl Writer {
         self.output.push(u8::from(value));
     }
 
+    /// A `char` is written as the Unicode scalar value it is, which is what
+    /// makes reading one a range check rather than a decode.
+    pub fn write_char(&mut self, value: char) {
+        self.write_u32(value as u32);
+    }
+
     write_scalars! {
         write_u8: u8,
         write_u16: u16,
         write_u32: u32,
         write_u64: u64,
+        write_u128: u128,
         write_i8: i8,
         write_i16: i16,
         write_i32: i32,
         write_i64: i64,
+        write_i128: i128,
         write_f32: f32,
         write_f64: f64,
     }
@@ -292,7 +319,10 @@ impl<'buf> Message<'buf> {
     pub fn read_bytes(&self, slot: u32) -> Result<&'buf [u8], Error> {
         let bytes = self.slot(slot)?;
         let length = read_word(bytes, 0)?;
-        bytes.get(WORD..WORD + length).ok_or(Error::UnexpectedEof)
+        // A length that cannot be added to is as out of bounds as one past the
+        // end of the buffer: nothing that long was ever written.
+        let end = length.checked_add(WORD).ok_or(Error::UnexpectedEof)?;
+        bytes.get(WORD..end).ok_or(Error::UnexpectedEof)
     }
 
     pub fn read_bool(&self, slot: u32) -> Result<bool, Error> {
@@ -303,6 +333,19 @@ impl<'buf> Message<'buf> {
         }
     }
 
+    pub fn read_char(&self, slot: u32) -> Result<char, Error> {
+        char::from_u32(self.read_u32(slot)?).ok_or(Error::InvalidChar)
+    }
+
+    /// Whether `slot` carries an entry, which is what tells `Some` from `None`.
+    ///
+    /// An optional field encodes `None` by leaving its slot unwritten, so this
+    /// is also false for a slot the writer did not have at all: a field added
+    /// as an optional one reads as absent rather than as missing.
+    pub fn is_present(&self, slot: u32) -> Result<bool, Error> {
+        Ok(self.frame.entry(slot as usize)?.is_some())
+    }
+
     /// Reads the tag of an encoded enum, naming the variant it holds.
     pub fn read_tag(&self) -> Result<u32, Error> {
         self.read_u32(TAG)
@@ -310,7 +353,19 @@ impl<'buf> Message<'buf> {
 
     /// Reads the fields of the variant an enum holds, which are only meaningful
     /// once its tag has been read.
+    ///
+    /// A variant that carries nothing writes no payload at all, so an absent
+    /// one is the frame of no fields rather than a missing field: a variant
+    /// that gained its first field is read the way a message that gained one
+    /// is, absent rather than missing.
     pub fn read_payload(&self) -> Result<Message<'buf>, Error> {
+        if self.frame.entry(PAYLOAD as usize)?.is_none() {
+            return Ok(Self {
+                frame: Frame::trusted(&EMPTY_FRAME),
+                depth: self.depth,
+                validate: self.validate,
+            });
+        }
         self.read_message(PAYLOAD)
     }
 
@@ -328,21 +383,24 @@ impl<'buf> Message<'buf> {
 
     /// Reads a list. When this message is being validated, every element is
     /// decoded here, so that reading one later cannot fail.
-    pub fn read_list<S: Zerializable + ?Sized>(
-        &self,
-        slot: u32,
-    ) -> Result<ListView<'buf, S>, Error> {
+    ///
+    /// A list is validated at this message's own depth: what it holds is one
+    /// level deeper than this message, which is the level an element that is
+    /// itself a message is read at.
+    pub fn read_list<E: Element + ?Sized>(&self, slot: u32) -> Result<ListView<'buf, E>, Error> {
         if self.depth == MAX_DEPTH {
             return Err(Error::RecursionLimit);
         }
         let list = ListView::new(Frame::read(self.slot(slot)?)?);
         if self.validate {
-            list.validate(self.depth + 1)?;
+            list.validate(self.depth)?;
         }
         Ok(list)
     }
 
-    pub(crate) fn element(frame: Frame<'buf>, depth: u32, validate: bool) -> Self {
+    /// A message over a frame reached from another one, at the depth that frame
+    /// sits at and validated as that one is.
+    pub(crate) fn nested(frame: Frame<'buf>, depth: u32, validate: bool) -> Self {
         Self {
             frame,
             depth,
@@ -355,10 +413,12 @@ impl<'buf> Message<'buf> {
         read_u16: u16,
         read_u32: u32,
         read_u64: u64,
+        read_u128: u128,
         read_i8: i8,
         read_i16: i16,
         read_i32: i32,
         read_i64: i64,
+        read_i128: i128,
         read_f32: f32,
         read_f64: f64,
     }

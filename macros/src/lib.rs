@@ -9,10 +9,10 @@ use proc_macro2::{Literal, TokenStream};
 use quote::{ToTokens, format_ident, quote};
 use syn::{
     Attribute, Data, DataEnum, DataStruct, DeriveInput, Error, Fields, FnArg, GenericArgument,
-    GenericParam, Generics, Ident, Item, ItemEnum, ItemTrait, LitInt, Meta, Path, PathArguments,
-    PathSegment, ReceiverKind, ReturnType, Safety, Signature, Token, TraitBound, TraitItem,
-    TraitItemFn, Type, TypeImplTrait, TypeParamBound, TypePath, Visibility, WherePredicate,
-    parse_quote, punctuated::Punctuated,
+    GenericParam, Generics, Ident, Item, ItemEnum, ItemTrait, Lifetime, LitInt, Meta, Path,
+    PathArguments, PathSegment, ReceiverKind, ReturnType, Safety, Signature, Token, TraitBound,
+    TraitItem, TraitItemFn, Type, TypeImplTrait, TypeParamBound, TypePath, Visibility,
+    WherePredicate, parse_quote, punctuated::Punctuated,
 };
 
 /// Turns a trait or an enum into a zero-copy serialization schema.
@@ -43,22 +43,41 @@ use syn::{
 ///
 /// Methods may return a scalar, `&str`, `&[u8]`, a value type named outright,
 /// a schema declared as a trait as `impl Trait + '_`, a schema declared as an
-/// enum as `Enum<impl Trait + '_>`, or a sequence of either as
+/// enum as `Enum<impl Trait + '_>`, or a sequence of any of them as
 /// `impl List<Item = ..> + '_`. Everything named as an `impl Trait` must be
 /// declared `where Self: Sized` to keep `dyn Trait` usable as the schema's
 /// name. A value type, being `Copy`, is instead returned as itself: see
 /// [`macro@Zerializable`].
 ///
+/// A list holds what a field holds, so `impl List<Item = u32> + '_` and
+/// `impl List<Item = &str> + '_` are lists as much as a list of messages is.
+/// What a list holds it hands out by value, which is what `Copied` hands out of
+/// an implementation storing it.
+///
+/// Any of those may be wrapped in an `Option`, which makes the field one the
+/// message need not carry. `None` is the slot left unwritten, which is exactly
+/// what a reader sees of a slot the writer did not have, so a field added as an
+/// optional one reads as `None` out of a message written before it existed.
+/// `Option<Option<..>>` is rejected: there is only one way for a slot to be
+/// absent.
+///
 /// # Enums
 ///
 /// An enum is a choice between messages. Every variant must declare the tag
 /// that names it with `#[variant(N)]`, and every field of a variant the slot it
-/// occupies with `#[n(N)]`. A field is either a scalar or one of the enum's
-/// parameters, each of which stands for a nested schema and so must be bound by
-/// the trait declaring it. A variant carries nothing, a tuple of fields, or
-/// named fields, and is built and matched the way it was declared. Naming a
-/// field changes how the enum reads rather than what it encodes as, since a
-/// slot is what names a field on the wire.
+/// occupies with `#[n(N)]`. A field is a scalar, `&str`, `&[u8]`, a value type,
+/// one of the enum's parameters, each of which stands for a nested schema and
+/// so must be bound by the trait declaring it, or an `Option` of any of them. A
+/// variant carries nothing, a tuple of fields, or named fields, and is built
+/// and matched the way it was declared. Naming a field changes how the enum
+/// reads rather than what it encodes as, since a slot is what names a field on
+/// the wire.
+///
+/// An enum whose fields borrow declares the lifetime they point into, and is
+/// named with it wherever it is named: `enum Note<'a, P: Person>` with a field
+/// written `&'a str` is `Note<'_, dyn Person>` as a schema, and
+/// `Note<'buf, PersonView<'buf>>` once decoded. Only an enum that borrows
+/// declares one, so an enum that does not is named exactly as before.
 ///
 /// The macro generates, from the enum:
 ///
@@ -317,10 +336,19 @@ fn strip_variant_attributes(item: &mut ItemEnum) {
 /// safe, and a struct may gain fields without breaking readers built against
 /// the older one. An enum may not: a reader rejects a variant it does not know.
 ///
-/// Fields may be scalars or other values, which is what keeps a value `Copy`:
-/// nothing it holds can borrow from the buffer it was read from. Nothing more
-/// is asked of the type, but a schema asked to print or compare its fields asks
-/// it of this one too, so a value a printed view carries must be `Debug`.
+/// A variant may carry fields of its own, declaring their slots as a struct
+/// does, and is built and matched the way it was declared. An enum whose
+/// variants all carry nothing is written as the number naming the one it holds,
+/// and so costs a `u32` wherever it is held; one whose variants carry fields is
+/// written the way a choice is, as that number and the frame of the fields it
+/// names. Giving a variant its first field therefore changes what the enum
+/// encodes as, which readers built against the older one cannot read.
+///
+/// Fields may be scalars, other values, or an `Option` of either, which is what
+/// keeps a value `Copy`: nothing it holds can borrow from the buffer it was read
+/// from, which is what separates a value enum from a choice. Nothing more is
+/// asked of the type, but a schema asked to print or compare its fields asks it
+/// of this one too, so a value a printed view carries must be `Debug`.
 #[proc_macro_derive(Zerializable, attributes(n, variant))]
 pub fn derive_zerializable(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let item = match syn::parse::<DeriveInput>(item) {
@@ -358,6 +386,10 @@ struct Schema<'a> {
 struct Choice<'a> {
     visibility: &'a Visibility,
     name: &'a Ident,
+    /// The lifetime the enum's borrowed fields point into, where it has any.
+    /// Only an enum that borrows declares one, and only such an enum is named
+    /// with one.
+    lifetime: Option<&'a Lifetime>,
     /// The parameters the enum carries nested schemas as, in declaration order.
     params: Vec<Param<'a>>,
     variants: Vec<Case<'a>>,
@@ -373,20 +405,45 @@ struct Param<'a> {
 }
 
 struct Case<'a> {
-    name: &'a Ident,
+    written: Written<'a>,
     tag: u32,
     fields: Vec<CaseField<'a>>,
-    style: Style,
 }
 
 /// How a variant is written, which is how it has to be matched and built: `V`,
 /// `V(..)`, and `V { .. }` are three different declarations to Rust, even where
-/// they carry the same fields.
+/// they carry the same fields. A choice's variants and a value enum's are
+/// written alike, so both are built and matched through this.
+struct Written<'a> {
+    name: &'a Ident,
+    style: Style,
+    /// The name of each field, where its variant gives it one.
+    fields: Vec<Option<&'a Ident>>,
+}
+
 #[derive(Clone, Copy)]
 enum Style {
     Unit,
     Tuple,
     Named,
+}
+
+impl<'a> Written<'a> {
+    fn new(variant: &'a syn::Variant) -> Self {
+        Self {
+            name: &variant.ident,
+            style: match &variant.fields {
+                Fields::Unit => Style::Unit,
+                Fields::Unnamed(_) => Style::Tuple,
+                Fields::Named(_) => Style::Named,
+            },
+            fields: variant
+                .fields
+                .iter()
+                .map(|field| field.ident.as_ref())
+                .collect(),
+        }
+    }
 }
 
 struct CaseField<'a> {
@@ -400,8 +457,17 @@ struct CaseField<'a> {
 enum Payload<'a> {
     /// A fixed width primitive, named by its Rust type.
     Scalar(&'a Ident),
+    /// A `&str`, which points into the buffer rather than being copied out of
+    /// it, and so is written in terms of the enum's lifetime.
+    Str,
+    /// A `&[u8]`, borrowed as a `&str` is.
+    Bytes,
+    /// A `Copy` type held by value, named by its path.
+    Value(&'a Path),
     /// A nested message, carried by one of the enum's parameters.
     Nested(Param<'a>),
+    /// A field that may be absent, written as `Option<..>`.
+    Optional(Box<Payload<'a>>),
 }
 
 struct Method<'a> {
@@ -422,8 +488,12 @@ enum Kind<'a> {
     Value(&'a Path),
     /// A nested schema.
     Nested(Nested<'a>),
-    /// A sequence of nested schemas.
-    Repeated(Nested<'a>),
+    /// A sequence of elements, each of whatever kind the list holds.
+    Repeated(Box<Kind<'a>>),
+    /// A field that may be absent, written as `Option<..>`. An absent field is
+    /// a slot left unwritten, which is what a reader that does not know the
+    /// slot at all sees too.
+    Optional(Box<Kind<'a>>),
 }
 
 /// A schema one method returns, named the way the method returns it.
@@ -465,12 +535,20 @@ fn carried_schemas(path: &TypePath) -> TypePath {
     };
     if let PathArguments::AngleBracketed(arguments) = &mut segment.arguments {
         for argument in &mut arguments.args {
-            if let GenericArgument::Type(ty) = argument
-                && let Type::ImplTrait(carried) = ty
-                && let Ok(bound) = trait_bound(carried)
-            {
-                let schema = &bound.path;
-                *ty = parse_quote!((dyn #schema + 'static));
+            match argument {
+                GenericArgument::Type(ty) => {
+                    if let Type::ImplTrait(carried) = ty
+                        && let Ok(bound) = trait_bound(carried)
+                    {
+                        let schema = &bound.path;
+                        *ty = parse_quote!((dyn #schema + 'static));
+                    }
+                }
+                // A schema is a name rather than a buffer, and is named for any
+                // lifetime, so the one an enum borrows from is spelled out here
+                // rather than left as the `'_` the method returning it wrote.
+                GenericArgument::Lifetime(lifetime) => *lifetime = parse_quote!('static),
+                _ => (),
             }
         }
     }
@@ -488,8 +566,20 @@ fn carries_schemas(path: &TypePath) -> bool {
     })
 }
 
-const SCALARS: [&str; 11] = [
-    "bool", "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64",
+/// Whether a path names a schema declared as an enum rather than a value named
+/// outright, which is what its arguments say: an enum is named over the schemas
+/// it carries and the buffer it borrows from, and a value, being `Copy` and free
+/// of both, has neither.
+fn names_a_choice(path: &TypePath) -> bool {
+    path.path.segments.last().is_some_and(|segment| {
+        matches!(&segment.arguments, PathArguments::AngleBracketed(arguments)
+            if !arguments.args.is_empty())
+    })
+}
+
+const SCALARS: [&str; 14] = [
+    "bool", "char", "u8", "u16", "u32", "u64", "u128", "i8", "i16", "i32", "i64", "i128", "f32",
+    "f64",
 ];
 
 // ============================================================
@@ -592,7 +682,7 @@ fn parse_method<'a>(function: &'a TraitItemFn, parsed: &[Method<'a>]) -> Result<
         ));
     };
     let kind = parse_return_type(return_type)?;
-    if matches!(kind, Kind::Nested(_) | Kind::Repeated(_)) && !requires_sized(signature) {
+    if returns_impl_trait(&kind) && !requires_sized(signature) {
         return Err(Error::new_spanned(
             return_type,
             "methods returning `impl Trait` must be declared `where Self: Sized`, \
@@ -647,11 +737,32 @@ fn parse_number(attribute: &Attribute, name: &str) -> Result<u32, Error> {
     number.base10_parse().map_err(|_| invalid())
 }
 
+/// How a field is named where a duplicate slot is reported against it.
+fn describe(name: Option<&Ident>, index: usize) -> String {
+    match name {
+        Some(name) => format!("`{name}`"),
+        None => format!("field {index}"),
+    }
+}
+
 fn takes_shared_self(signature: &Signature) -> bool {
     signature.variadic.is_none()
         && signature.inputs.len() == 1
         && matches!(signature.inputs.first(), Some(FnArg::Receiver(receiver))
             if matches!(receiver.kind, ReceiverKind::Reference(_, _, None)))
+}
+
+/// Whether a return type is written as an `impl Trait`, which is what a method
+/// has to be declared `where Self: Sized` for.
+fn returns_impl_trait(kind: &Kind<'_>) -> bool {
+    match kind {
+        // An enum is a type rather than a trait, so it is only an `impl Trait`
+        // where it carries one.
+        Kind::Nested(Nested::Choice(path)) => carries_schemas(path),
+        Kind::Nested(Nested::Message(_)) | Kind::Repeated(_) => true,
+        Kind::Optional(inner) => returns_impl_trait(inner),
+        _ => false,
+    }
 }
 
 /// Whether a method is declared `where Self: Sized`, which is what keeps a
@@ -687,13 +798,45 @@ fn scalar(path: &TypePath) -> Option<&Ident> {
     named(path).filter(|name| SCALARS.iter().any(|scalar| *name == scalar))
 }
 
+/// The type an `Option<..>` wraps, if the path names one.
+fn optional(path: &TypePath) -> Option<&Type> {
+    if path.qself.is_some() {
+        return None;
+    }
+    let segment = path.path.segments.last()?;
+    if segment.ident != "Option" {
+        return None;
+    }
+    let PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+        return None;
+    };
+    match arguments.args.first() {
+        Some(GenericArgument::Type(ty)) if arguments.args.len() == 1 => Some(ty),
+        _ => None,
+    }
+}
+
+/// Rejects `Option<Option<..>>`, which the wire has nothing to distinguish:
+/// what encodes `None` is an unwritten slot, and a slot is either written or
+/// it is not.
+fn require_not_optional(ty: &Type, optional: bool) -> Result<(), Error> {
+    if optional {
+        return Err(Error::new_spanned(
+            ty,
+            "`Option<Option<..>>` has no encoding: an absent field is a slot left \
+             unwritten, so there is nothing left for the inner one to be absent in",
+        ));
+    }
+    Ok(())
+}
+
 fn parse_return_type(ty: &Type) -> Result<Kind<'_>, Error> {
     let unsupported = || {
         Error::new_spanned(
             ty,
             "unsupported return type: expected a scalar, a value type, `&str`, \
-             `&[u8]`, `impl Trait + '_`, `Enum<impl Trait + '_>`, or a list of \
-             either",
+             `&[u8]`, `impl Trait + '_`, `Enum<impl Trait + '_>`, a list of \
+             either, or an `Option` of any of them",
         )
     };
 
@@ -706,6 +849,13 @@ fn parse_return_type(ty: &Type) -> Result<Kind<'_>, Error> {
             },
             _ => Err(unsupported()),
         },
+        // An optional field is whatever it wraps, in a slot that may be left
+        // unwritten, so it is parsed as what it wraps.
+        Type::Path(path) if optional(path).is_some() => {
+            let inner = parse_return_type(optional(path).expect("the path names an Option"))?;
+            require_not_optional(ty, matches!(inner, Kind::Optional(_)))?;
+            Ok(Kind::Optional(Box::new(inner)))
+        }
         // A path carrying schemas is one declared as an enum, returned as
         // itself rather than as `impl Trait` because an enum is a type and not
         // a trait. Anything else named outright is a value: a
@@ -713,7 +863,7 @@ fn parse_return_type(ty: &Type) -> Result<Kind<'_>, Error> {
         // than as a view of the buffer.
         Type::Path(path) if path.qself.is_none() => Ok(match scalar(path) {
             Some(scalar) => Kind::Scalar(scalar),
-            None if carries_schemas(path) => Kind::Nested(Nested::Choice(path)),
+            None if names_a_choice(path) => Kind::Nested(Nested::Choice(path)),
             None => Kind::Value(&path.path),
         }),
         Type::ImplTrait(impl_trait) => {
@@ -724,7 +874,7 @@ fn parse_return_type(ty: &Type) -> Result<Kind<'_>, Error> {
                 .last()
                 .expect("a path has at least one segment");
             if segment.ident == "List" {
-                Ok(Kind::Repeated(parse_list_item(segment)?))
+                Ok(Kind::Repeated(Box::new(parse_list_item(segment)?)))
             } else {
                 Ok(Kind::Nested(Nested::Message(&bound.path)))
             }
@@ -746,14 +896,13 @@ fn trait_bound(impl_trait: &TypeImplTrait) -> Result<&TraitBound, Error> {
     }
 }
 
-/// Extracts the element schema out of the `<Item = ..>` that follows
-/// `impl List`, named there the way a method returning one element would.
-fn parse_list_item(list: &PathSegment) -> Result<Nested<'_>, Error> {
+/// Extracts the element out of the `<Item = ..>` that follows `impl List`,
+/// named there the way a method returning one element would name it.
+fn parse_list_item(list: &PathSegment) -> Result<Kind<'_>, Error> {
     let expected = || {
         Error::new_spanned(
             list,
-            "expected `impl List<Item = impl Trait + '_> + '_`, naming the schema \
-             the list holds",
+            "expected `impl List<Item = ..> + '_`, naming what the list holds",
         )
     };
     let PathArguments::AngleBracketed(arguments) = &list.arguments else {
@@ -767,12 +916,17 @@ fn parse_list_item(list: &PathSegment) -> Result<Nested<'_>, Error> {
             _ => None,
         })
         .ok_or_else(expected)?;
-    match item {
-        Type::ImplTrait(item) => Ok(Nested::Message(&trait_bound(item)?.path)),
-        // As in a return type, a path is a schema declared as an enum only
-        // where it carries the schemas it holds.
-        Type::Path(path) if carries_schemas(path) => Ok(Nested::Choice(path)),
-        _ => Err(expected()),
+    // An element is an entry of the list's frame, and an entry holds one thing:
+    // a shorter list is what an absent element is, and a list of lists has no
+    // entry to nest the inner one in.
+    match parse_return_type(item)? {
+        Kind::Optional(_) => Err(Error::new_spanned(
+            item,
+            "a list may not hold `Option`: an element that is not there is a \
+             shorter list",
+        )),
+        Kind::Repeated(_) => Err(Error::new_spanned(item, "a list may not hold lists")),
+        item => Ok(item),
     }
 }
 
@@ -784,14 +938,34 @@ fn parse_choice(item: &ItemEnum) -> Result<Choice<'_>, Error> {
         ));
     }
 
+    let mut lifetime = None;
     let mut params = Vec::new();
     for param in &item.generics.params {
-        params.push(parse_param(param)?);
+        match param {
+            GenericParam::Lifetime(declared) if lifetime.is_none() => {
+                if !declared.bounds.is_empty() {
+                    return Err(Error::new_spanned(
+                        &declared.bounds,
+                        "a #[zerializable] enum's lifetime may not have bounds: it is the \
+                         buffer its borrowed fields point into",
+                    ));
+                }
+                lifetime = Some(&declared.lifetime);
+            }
+            GenericParam::Lifetime(declared) => {
+                return Err(Error::new_spanned(
+                    declared,
+                    "a #[zerializable] enum may declare one lifetime, which is the buffer \
+                     every borrowed field of it points into",
+                ));
+            }
+            _ => params.push(parse_param(param)?),
+        }
     }
 
     let mut variants = Vec::new();
     for variant in &item.variants {
-        variants.push(parse_case(variant, &params, &variants)?);
+        variants.push(parse_case(variant, &params, lifetime.is_some(), &variants)?);
     }
     if variants.is_empty() {
         return Err(Error::new_spanned(
@@ -806,7 +980,7 @@ fn parse_choice(item: &ItemEnum) -> Result<Choice<'_>, Error> {
         let carried = variants
             .iter()
             .flat_map(|variant| &variant.fields)
-            .any(|field| matches!(field.payload, Payload::Nested(by) if by.name == param.name));
+            .any(|field| carries(&field.payload, param));
         if !carried {
             return Err(Error::new_spanned(
                 param.name,
@@ -815,9 +989,24 @@ fn parse_choice(item: &ItemEnum) -> Result<Choice<'_>, Error> {
         }
     }
 
+    // A lifetime nothing borrows from would leave the generated enum with a
+    // parameter it does not use, exactly as an uncarried parameter would.
+    if let Some(lifetime) = lifetime
+        && !variants
+            .iter()
+            .flat_map(|variant| &variant.fields)
+            .any(|field| borrows(&field.payload))
+    {
+        return Err(Error::new_spanned(
+            lifetime,
+            format!("no field borrows from `{lifetime}`"),
+        ));
+    }
+
     Ok(Choice {
         visibility: &item.vis,
         name: &item.ident,
+        lifetime,
         params,
         variants,
     })
@@ -829,7 +1018,8 @@ fn parse_param(param: &GenericParam) -> Result<Param<'_>, Error> {
     let GenericParam::Type(param) = param else {
         return Err(Error::new_spanned(
             param,
-            "#[zerializable] enums may only be generic over the schemas they carry",
+            "#[zerializable] enums may only be generic over the schemas they carry, \
+             beside the one lifetime their borrowed fields point into",
         ));
     };
     if let Some((_, default)) = &param.default {
@@ -860,6 +1050,7 @@ fn parse_param(param: &GenericParam) -> Result<Param<'_>, Error> {
 fn parse_case<'a>(
     variant: &'a syn::Variant,
     params: &[Param<'a>],
+    borrows: bool,
     parsed: &[Case<'a>],
 ) -> Result<Case<'a>, Error> {
     if let Some((_, discriminant)) = &variant.discriminant {
@@ -870,14 +1061,9 @@ fn parse_case<'a>(
         ));
     }
 
-    let style = match &variant.fields {
-        Fields::Unit => Style::Unit,
-        Fields::Unnamed(_) => Style::Tuple,
-        Fields::Named(_) => Style::Named,
-    };
     let mut fields = Vec::new();
     for field in &variant.fields {
-        fields.push(parse_case_field(field, params, &fields)?);
+        fields.push(parse_case_field(field, params, borrows, &fields)?);
     }
 
     let Some((tag, attribute)) = declared_number(&variant.attrs, "variant")? else {
@@ -889,24 +1075,27 @@ fn parse_case<'a>(
     if let Some(previous) = parsed.iter().find(|variant| variant.tag == tag) {
         return Err(Error::new_spanned(
             attribute,
-            format!("variant {tag} is already used by `{}`", previous.name),
+            format!(
+                "variant {tag} is already used by `{}`",
+                previous.written.name
+            ),
         ));
     }
 
     Ok(Case {
-        name: &variant.ident,
+        written: Written::new(variant),
         tag,
         fields,
-        style,
     })
 }
 
 fn parse_case_field<'a>(
     field: &'a syn::Field,
     params: &[Param<'a>],
+    borrows: bool,
     parsed: &[CaseField<'a>],
 ) -> Result<CaseField<'a>, Error> {
-    let payload = parse_payload(&field.ty, params)?;
+    let payload = parse_payload(&field.ty, params, borrows)?;
 
     let Some((slot, attribute)) = declared_number(&field.attrs, "n")? else {
         return Err(Error::new_spanned(
@@ -915,10 +1104,7 @@ fn parse_case_field<'a>(
         ));
     };
     if let Some(index) = parsed.iter().position(|other| other.slot == slot) {
-        let previous = match parsed[index].name {
-            Some(name) => format!("`{name}`"),
-            None => format!("field {index}"),
-        };
+        let previous = describe(parsed[index].name, index);
         return Err(Error::new_spanned(
             attribute,
             format!("slot {slot} is already used by {previous}"),
@@ -932,25 +1118,66 @@ fn parse_case_field<'a>(
     })
 }
 
-fn parse_payload<'a>(ty: &'a Type, params: &[Param<'a>]) -> Result<Payload<'a>, Error> {
+fn parse_payload<'a>(
+    ty: &'a Type,
+    params: &[Param<'a>],
+    borrows: bool,
+) -> Result<Payload<'a>, Error> {
     let unsupported = || {
         Error::new_spanned(
             ty,
-            "unsupported field type: expected a scalar, or a parameter naming \
-             the schema the field carries",
+            "unsupported field type: expected a scalar, `&str`, `&[u8]`, a value \
+             type, a parameter naming the schema the field carries, or an \
+             `Option` of any of them",
         )
     };
+
+    // A borrowed field points into the buffer the enum was decoded from, which
+    // is what the enum's lifetime stands for, so an enum that has one may hold
+    // them and an enum that does not may not.
+    if let Type::Reference(reference) = ty
+        && reference.mutability.is_none()
+    {
+        if !borrows {
+            return Err(Error::new_spanned(
+                ty,
+                "a variant carrying a borrowed field needs the enum to declare the \
+                 lifetime it points into, `enum Name<'a, ..>`, and to write the \
+                 field as `&'a str` or `&'a [u8]`",
+            ));
+        }
+        return match &*reference.elem {
+            Type::Path(path) if named(path).is_some_and(|name| name == "str") => Ok(Payload::Str),
+            Type::Slice(slice) => match &*slice.elem {
+                Type::Path(path) if named(path).is_some_and(|name| name == "u8") => {
+                    Ok(Payload::Bytes)
+                }
+                _ => Err(unsupported()),
+            },
+            _ => Err(unsupported()),
+        };
+    }
 
     let Type::Path(path) = ty else {
         return Err(unsupported());
     };
+    if let Some(inner) = optional(path) {
+        let inner = parse_payload(inner, params, borrows)?;
+        require_not_optional(ty, matches!(inner, Payload::Optional(_)))?;
+        return Ok(Payload::Optional(Box::new(inner)));
+    }
+    if path.qself.is_some() {
+        return Err(unsupported());
+    }
     let name = named(path).ok_or_else(unsupported)?;
     if let Some(param) = params.iter().find(|param| param.name == name) {
         Ok(Payload::Nested(*param))
     } else if SCALARS.iter().any(|scalar| name == scalar) {
         Ok(Payload::Scalar(name))
+    // Anything else named outright is a value, exactly as it is where a method
+    // returns one: a `#[derive(Zerializable)]` type, carried by value.
     } else {
-        Err(unsupported())
+        Ok(Payload::Value(&path.path))
     }
 }
 
@@ -958,8 +1185,239 @@ fn parse_payload<'a>(ty: &'a Type, params: &[Param<'a>]) -> Result<Payload<'a>, 
 // Code generation
 // ============================================================
 
+const VALIDATED: &str = "the message was validated when it was decoded";
+
+/// Writes the field a method returns into the entry it occupies of the frame
+/// `frame` marks, given the expression the field is read from.
+///
+/// Every generator below is written this way, over the field's kind rather than
+/// over the method holding it, so that `Option<..>` is the same field in a slot
+/// that may be left unwritten.
+fn write_field(
+    kind: &Kind<'_>,
+    frame: &Ident,
+    entry: &TokenStream,
+    value: &TokenStream,
+) -> TokenStream {
+    // An absent field is a slot left unwritten, so `None` writes nothing at
+    // all: the offset reserved for it is already zero.
+    if let Kind::Optional(inner) = kind {
+        let written = write_field(inner, frame, entry, &quote!(__some));
+        return quote! {
+            if let ::core::option::Option::Some(__some) = #value {
+                #written
+            }
+        };
+    }
+
+    let write = match kind {
+        Kind::Str => quote!(__writer.write_str(#value);),
+        Kind::Bytes => quote!(__writer.write_bytes(#value);),
+        Kind::Scalar(scalar) => {
+            let write = format_ident!("write_{}", scalar);
+            quote!(__writer.#write(#value);)
+        }
+        Kind::Value(path) => quote! {
+            <#path as ::zerialize::Value>::encode_value(&#value, __writer);
+        },
+        Kind::Nested(nested) => {
+            let schema = schema_of(*nested);
+            quote! {
+                let __value = #value;
+                <#schema as ::zerialize::Zerializable>::encode_source(&__value, __writer);
+            }
+        }
+        // A list is a frame of its own, so an element is written into the entry
+        // it occupies exactly as a field is written into its slot.
+        Kind::Repeated(item) => {
+            let list = format_ident!("__list");
+            let written = write_field(item, &list, &quote!(__index), &quote!(__item));
+            quote! {
+                let __items = #value;
+                let __length = ::zerialize::List::len(&__items);
+                let __list = __writer.begin_frame(__length);
+                for __index in 0..__length {
+                    let __item = ::zerialize::List::get(&__items, __index)
+                        .expect("List::get returned None below List::len");
+                    #written
+                }
+                __writer.end_frame(__list);
+            }
+        }
+        Kind::Optional(_) => unreachable!("an optional field is written above"),
+    };
+    quote! {
+        __writer.begin_entry(&#frame, #entry);
+        #write
+    }
+}
+
+/// The entry of a frame a field occupies, which is its slot.
+fn entry_of(slot: u32) -> TokenStream {
+    let entry = Literal::usize_suffixed(slot as usize);
+    quote!(#entry)
+}
+
+/// How long the offset table of a frame holding `slots` is. The table is
+/// indexed by slot, so it is as long as the highest one, whatever the frame
+/// holds and however many of them it leaves empty.
+fn table(slots: impl Iterator<Item = u32>) -> Literal {
+    Literal::usize_suffixed(slots.map(|slot| slot as usize + 1).max().unwrap_or(0))
+}
+
+/// Names what a list holds, as [`::zerialize::Element`] is implemented for it:
+/// a schema by the name of the schema, a value by its own name, and a primitive
+/// by what it is, which for the two that borrow is what they point at.
+fn element_of(item: &Kind<'_>) -> TokenStream {
+    match item {
+        Kind::Str => quote!(::core::primitive::str),
+        Kind::Bytes => quote!([::core::primitive::u8]),
+        Kind::Scalar(scalar) => quote!(#scalar),
+        Kind::Value(path) => quote!(#path),
+        Kind::Nested(nested) => schema_of(*nested),
+        Kind::Optional(_) | Kind::Repeated(_) => {
+            unreachable!("a list holds neither an Option nor a list")
+        }
+    }
+}
+
+/// The type an accessor hands back: the field's own, with every nested schema
+/// named as the view it decodes to.
+fn view_type(kind: &Kind<'_>) -> TokenStream {
+    match kind {
+        Kind::Str => quote!(&'buf str),
+        Kind::Bytes => quote!(&'buf [u8]),
+        Kind::Scalar(scalar) => quote!(#scalar),
+        Kind::Value(path) => quote!(#path),
+        Kind::Nested(nested) => view_of(*nested),
+        Kind::Repeated(item) => {
+            let element = element_of(item);
+            quote!(::zerialize::ListView<'buf, #element>)
+        }
+        Kind::Optional(inner) => {
+            let inner = view_type(inner);
+            quote!(::core::option::Option<#inner>)
+        }
+    }
+}
+
+/// Reads the field out of `__message`, which decoding has already validated,
+/// so that nothing here can fail.
+fn read_field(kind: &Kind<'_>, slot: u32) -> TokenStream {
+    let entry = Literal::u32_suffixed(slot);
+    match kind {
+        Kind::Str => quote!(__message.read_str(#entry).expect(#VALIDATED)),
+        Kind::Bytes => quote!(__message.read_bytes(#entry).expect(#VALIDATED)),
+        Kind::Scalar(scalar) => {
+            let read = format_ident!("read_{}", scalar);
+            quote!(__message.#read(#entry).expect(#VALIDATED))
+        }
+        Kind::Value(path) => quote! {
+            <#path as ::zerialize::Value>::decode_value(__message, #entry).expect(#VALIDATED)
+        },
+        Kind::Nested(nested) => {
+            let schema = schema_of(*nested);
+            quote! {
+                <#schema as ::zerialize::Zerializable>::decode_view(
+                    __message.read_message(#entry).expect(#VALIDATED),
+                )
+                .expect(#VALIDATED)
+            }
+        }
+        Kind::Repeated(_) => quote!(__message.read_list(#entry).expect(#VALIDATED)),
+        Kind::Optional(inner) => {
+            let read = read_field(inner, slot);
+            quote! {
+                if __message.is_present(#entry).expect(#VALIDATED) {
+                    ::core::option::Option::Some(#read)
+                } else {
+                    ::core::option::Option::None
+                }
+            }
+        }
+    }
+}
+
+/// Reads the field to check it, which is what validation is: it leaves the
+/// accessors above nothing that can fail.
+fn check_field(kind: &Kind<'_>, slot: u32) -> TokenStream {
+    let entry = Literal::u32_suffixed(slot);
+    match kind {
+        Kind::Str => quote!(__message.read_str(#entry)?;),
+        Kind::Bytes => quote!(__message.read_bytes(#entry)?;),
+        Kind::Scalar(scalar) => {
+            let read = format_ident!("read_{}", scalar);
+            quote!(__message.#read(#entry)?;)
+        }
+        Kind::Value(path) => {
+            quote!(<#path as ::zerialize::Value>::decode_value(__message, #entry)?;)
+        }
+        Kind::Nested(nested) => {
+            let schema = schema_of(*nested);
+            quote! {
+                <#schema as ::zerialize::Zerializable>::decode_view(
+                    __message.read_message(#entry)?,
+                )?;
+            }
+        }
+        Kind::Repeated(item) => {
+            let element = element_of(item);
+            quote!(__message.read_list::<#element>(#entry)?;)
+        }
+        // An absent field is not a missing one, so it is checked only where it
+        // is present.
+        Kind::Optional(inner) => {
+            let check = check_field(inner, slot);
+            quote! {
+                if __message.is_present(#entry)? {
+                    #check
+                }
+            }
+        }
+    }
+}
+
+/// Statements that return `false` from a comparison where the two sides differ.
+fn compare_field(kind: &Kind<'_>, mine: &TokenStream, theirs: &TokenStream) -> TokenStream {
+    match kind {
+        Kind::Repeated(_) => quote! {
+            let __mine = #mine;
+            let __theirs = #theirs;
+            if ::zerialize::List::len(&__mine) != ::zerialize::List::len(&__theirs) {
+                return false;
+            }
+            for (__left, __right) in
+                ::zerialize::List::iter(&__mine).zip(::zerialize::List::iter(&__theirs))
+            {
+                if __left != __right {
+                    return false;
+                }
+            }
+        },
+        Kind::Optional(inner) => {
+            let compared = compare_field(inner, &quote!(__some), &quote!(__other));
+            quote! {
+                match (#mine, #theirs) {
+                    (
+                        ::core::option::Option::Some(__some),
+                        ::core::option::Option::Some(__other),
+                    ) => {
+                        #compared
+                    }
+                    (::core::option::Option::None, ::core::option::Option::None) => {}
+                    _ => return false,
+                }
+            }
+        }
+        _ => quote! {
+            if #mine != #theirs {
+                return false;
+            }
+        },
+    }
+}
+
 fn generate_schema(schema: &Schema<'_>, derived: Derived) -> TokenStream {
-    const VALIDATED: &str = "the message was validated when it was decoded";
     let Schema {
         visibility,
         name,
@@ -968,57 +1426,15 @@ fn generate_schema(schema: &Schema<'_>, derived: Derived) -> TokenStream {
     let view = format_ident!("{}View", name);
     let source = format_ident!("__{}Source", name);
     // The offset table is indexed by slot, so it is as long as the highest one.
-    let slots = Literal::usize_suffixed(
-        methods
-            .iter()
-            .map(|method| method.slot as usize + 1)
-            .max()
-            .unwrap_or(0),
-    );
+    let slots = table(methods.iter().map(|method| method.slot));
 
+    let frame = format_ident!("__frame");
     let encoded = methods.iter().map(|method| {
-        let entry = Literal::usize_suffixed(method.slot as usize);
         let value = {
             let method = method.name;
             quote!(<Self as #name>::#method(self))
         };
-        let write = match &method.kind {
-            Kind::Str => quote!(__writer.write_str(#value);),
-            Kind::Bytes => quote!(__writer.write_bytes(#value);),
-            Kind::Scalar(scalar) => {
-                let write = format_ident!("write_{}", scalar);
-                quote!(__writer.#write(#value);)
-            }
-            Kind::Value(path) => quote! {
-                <#path as ::zerialize::Value>::encode_value(&#value, __writer);
-            },
-            Kind::Nested(nested) => {
-                let schema = schema_of(*nested);
-                quote! {
-                    let __value = #value;
-                    <#schema as ::zerialize::Zerializable>::encode_source(&__value, __writer);
-                }
-            }
-            Kind::Repeated(nested) => {
-                let schema = schema_of(*nested);
-                quote! {
-                    let __items = #value;
-                    let __length = ::zerialize::List::len(&__items);
-                    let __list = __writer.begin_frame(__length);
-                    for __index in 0..__length {
-                        let __item = ::zerialize::List::get(&__items, __index)
-                            .expect("List::get returned None below List::len");
-                        __writer.begin_entry(&__list, __index);
-                        <#schema as ::zerialize::Zerializable>::encode_source(&__item, __writer);
-                    }
-                    __writer.end_frame(__list);
-                }
-            }
-        };
-        quote! {
-            __writer.begin_entry(&__frame, #entry);
-            #write
-        }
+        write_field(&method.kind, &frame, &entry_of(method.slot), &value)
     });
 
     // So that an implementation can return `&self.nested` as `impl Trait + '_`.
@@ -1036,50 +1452,8 @@ fn generate_schema(schema: &Schema<'_>, derived: Derived) -> TokenStream {
     // rather than the trait's opaque `impl Trait`, which lets callers keep
     // using nested views as views.
     let accessors = methods.iter().map(|method| {
-        let slot = Literal::u32_suffixed(method.slot);
-        let (return_type, body) = match &method.kind {
-            Kind::Str => (
-                quote!(&'buf str),
-                quote!(__message.read_str(#slot).expect(#VALIDATED)),
-            ),
-            Kind::Bytes => (
-                quote!(&'buf [u8]),
-                quote!(__message.read_bytes(#slot).expect(#VALIDATED)),
-            ),
-            Kind::Scalar(scalar) => {
-                let read = format_ident!("read_{}", scalar);
-                (
-                    quote!(#scalar),
-                    quote!(__message.#read(#slot).expect(#VALIDATED)),
-                )
-            }
-            Kind::Value(path) => (
-                quote!(#path),
-                quote! {
-                    <#path as ::zerialize::Value>::decode_value(__message, #slot)
-                        .expect(#VALIDATED)
-                },
-            ),
-            Kind::Nested(nested) => {
-                let schema = schema_of(*nested);
-                (
-                    view_of(*nested),
-                    quote! {
-                        <#schema as ::zerialize::Zerializable>::decode_view(
-                            __message.read_message(#slot).expect(#VALIDATED),
-                        )
-                        .expect(#VALIDATED)
-                    },
-                )
-            }
-            Kind::Repeated(nested) => {
-                let schema = schema_of(*nested);
-                (
-                    quote!(::zerialize::ListView<'buf, #schema>),
-                    quote!(__message.read_list(#slot).expect(#VALIDATED)),
-                )
-            }
-        };
+        let return_type = view_type(&method.kind);
+        let body = read_field(&method.kind, method.slot);
         let method = method.name;
         quote! {
             #visibility fn #method(&self) -> #return_type {
@@ -1105,27 +1479,7 @@ fn generate_schema(schema: &Schema<'_>, derived: Derived) -> TokenStream {
         let field = method.name;
         let mine = quote!(#view::#field(self));
         let theirs = quote!(<__S as #name>::#field(__other));
-        match &method.kind {
-            Kind::Repeated(_) => quote! {
-                let __mine = #mine;
-                let __theirs = #theirs;
-                if ::zerialize::List::len(&__mine) != ::zerialize::List::len(&__theirs) {
-                    return false;
-                }
-                for (__left, __right) in
-                    ::zerialize::List::iter(&__mine).zip(::zerialize::List::iter(&__theirs))
-                {
-                    if __left != __right {
-                        return false;
-                    }
-                }
-            },
-            _ => quote! {
-                if #mine != #theirs {
-                    return false;
-                }
-            },
-        }
+        compare_field(&method.kind, &mine, &theirs)
     });
 
     // Debug reads the fields rather than the bytes, so a view prints as the
@@ -1138,32 +1492,9 @@ fn generate_schema(schema: &Schema<'_>, derived: Derived) -> TokenStream {
 
     // Reading every field is what validation is: it leaves the accessors above
     // nothing that can fail.
-    let checks = methods.iter().map(|method| {
-        let slot = Literal::u32_suffixed(method.slot);
-        match &method.kind {
-            Kind::Str => quote!(__message.read_str(#slot)?;),
-            Kind::Bytes => quote!(__message.read_bytes(#slot)?;),
-            Kind::Scalar(scalar) => {
-                let read = format_ident!("read_{}", scalar);
-                quote!(__message.#read(#slot)?;)
-            }
-            Kind::Value(path) => {
-                quote!(<#path as ::zerialize::Value>::decode_value(__message, #slot)?;)
-            }
-            Kind::Nested(nested) => {
-                let schema = schema_of(*nested);
-                quote! {
-                    <#schema as ::zerialize::Zerializable>::decode_view(
-                        __message.read_message(#slot)?,
-                    )?;
-                }
-            }
-            Kind::Repeated(nested) => {
-                let schema = schema_of(*nested);
-                quote!(__message.read_list::<#schema>(#slot)?;)
-            }
-        }
-    });
+    let checks = methods
+        .iter()
+        .map(|method| check_field(&method.kind, method.slot));
     let validate = if methods.is_empty() {
         TokenStream::new()
     } else {
@@ -1270,6 +1601,19 @@ fn generate_schema(schema: &Schema<'_>, derived: Derived) -> TokenStream {
             }
         }
 
+        // So that a list may hold this schema. A list is a frame, so an
+        // element is read out of it the way a field is read out of a message.
+        impl ::zerialize::Element for dyn #name {
+            type Item<'buf> = #view<'buf>;
+
+            fn decode_element<'buf>(
+                __list: ::zerialize::Message<'buf>,
+                __index: ::core::primitive::u32,
+            ) -> ::core::result::Result<Self::Item<'buf>, ::zerialize::Error> {
+                <Self as ::zerialize::Zerializable>::decode_view(__list.read_message(__index)?)
+            }
+        }
+
         // So that an enum may carry this schema: an enum over the name of a
         // schema carries nothing, since it is a name rather than a value.
         impl ::zerialize::SchemaArg for dyn #name {
@@ -1278,13 +1622,160 @@ fn generate_schema(schema: &Schema<'_>, derived: Derived) -> TokenStream {
     }
 }
 
-/// The enum instantiated over `arguments`, which is the enum itself when it
-/// carries no schemas.
-fn instantiate<T: ToTokens>(name: &Ident, arguments: &[T]) -> TokenStream {
-    if arguments.is_empty() {
-        quote!(#name)
-    } else {
-        quote!(#name<#(#arguments),*>)
+/// Writes what a variant carries into the entry it occupies of the payload
+/// frame `frame` marks, given the binding its field was matched to.
+fn write_payload(
+    payload: &Payload<'_>,
+    frame: &Ident,
+    slot: u32,
+    binding: &TokenStream,
+) -> TokenStream {
+    if let Payload::Optional(inner) = payload {
+        let written = write_payload(inner, frame, slot, &quote!(__some));
+        return quote! {
+            if let ::core::option::Option::Some(__some) = #binding {
+                #written
+            }
+        };
+    }
+
+    let entry = Literal::usize_suffixed(slot as usize);
+    let write = match payload {
+        Payload::Scalar(scalar) => {
+            let write = format_ident!("write_{}", scalar);
+            quote!(__writer.#write(*#binding);)
+        }
+        Payload::Str => quote!(__writer.write_str(#binding);),
+        Payload::Bytes => quote!(__writer.write_bytes(#binding);),
+        Payload::Value(path) => quote! {
+            <#path as ::zerialize::Value>::encode_value(#binding, __writer);
+        },
+        Payload::Nested(carried) => {
+            let schema = schema_of(Nested::Message(carried.schema));
+            quote! {
+                <#schema as ::zerialize::Zerializable>::encode_source(#binding, __writer);
+            }
+        }
+        Payload::Optional(_) => unreachable!("an optional field is written above"),
+    };
+    quote! {
+        __writer.begin_entry(&#frame, #entry);
+        #write
+    }
+}
+
+/// Reads what a variant carries out of `__payload`, which is where reading a
+/// choice is checked: the fields of the variant its tag named.
+fn read_payload(payload: &Payload<'_>, slot: u32) -> TokenStream {
+    let entry = Literal::u32_suffixed(slot);
+    match payload {
+        Payload::Scalar(scalar) => {
+            let read = format_ident!("read_{}", scalar);
+            quote!(__payload.#read(#entry)?)
+        }
+        Payload::Str => quote!(__payload.read_str(#entry)?),
+        Payload::Bytes => quote!(__payload.read_bytes(#entry)?),
+        Payload::Value(path) => {
+            quote!(<#path as ::zerialize::Value>::decode_value(__payload, #entry)?)
+        }
+        Payload::Nested(carried) => {
+            let schema = schema_of(Nested::Message(carried.schema));
+            quote! {
+                <#schema as ::zerialize::Zerializable>::decode_view(
+                    __payload.read_message(#entry)?,
+                )?
+            }
+        }
+        Payload::Optional(inner) => {
+            let read = read_payload(inner, slot);
+            quote! {
+                if __payload.is_present(#entry)? {
+                    ::core::option::Option::Some(#read)
+                } else {
+                    ::core::option::Option::None
+                }
+            }
+        }
+    }
+}
+
+/// What a matched field is handed out as by `as_ref`: a message is borrowed,
+/// and a scalar, which is carried by value, is copied.
+fn borrow_payload(payload: &Payload<'_>, binding: &TokenStream) -> TokenStream {
+    match payload {
+        // A scalar and a value are carried by value, and a borrowed field is
+        // already a handle, so a reference to one is not what the borrowed enum
+        // holds.
+        Payload::Scalar(_) | Payload::Str | Payload::Bytes | Payload::Value(_) => {
+            quote!(*#binding)
+        }
+        Payload::Nested(_) => quote!(#binding),
+        Payload::Optional(inner) => match &**inner {
+            Payload::Nested(_) => quote!(::core::option::Option::as_ref(#binding)),
+            _ => quote!(*#binding),
+        },
+    }
+}
+
+/// Statements that return `false` from a comparison where the two sides differ.
+fn compare_payload(payload: &Payload<'_>, mine: &TokenStream, theirs: &TokenStream) -> TokenStream {
+    match payload {
+        Payload::Optional(inner) => {
+            let compared = compare_payload(inner, &quote!(__some), &quote!(__other));
+            quote! {
+                match (#mine, #theirs) {
+                    (
+                        ::core::option::Option::Some(__some),
+                        ::core::option::Option::Some(__other),
+                    ) => {
+                        #compared
+                    }
+                    (::core::option::Option::None, ::core::option::Option::None) => {}
+                    _ => return false,
+                }
+            }
+        }
+        _ => quote! {
+            if #mine != #theirs {
+                return false;
+            }
+        },
+    }
+}
+
+/// Whether a field carries `param`, which is what an enum's parameters are
+/// checked against: a parameter no field carries is one the generated enum
+/// would not use.
+fn carries(payload: &Payload<'_>, param: &Param<'_>) -> bool {
+    match payload {
+        Payload::Nested(by) => by.name == param.name,
+        Payload::Optional(inner) => carries(inner, param),
+        Payload::Scalar(_) | Payload::Str | Payload::Bytes | Payload::Value(_) => false,
+    }
+}
+
+/// Whether a field points into the buffer, which is what the enum's lifetime
+/// stands for.
+fn borrows(payload: &Payload<'_>) -> bool {
+    match payload {
+        Payload::Str | Payload::Bytes => true,
+        Payload::Optional(inner) => borrows(inner),
+        Payload::Scalar(_) | Payload::Value(_) | Payload::Nested(_) => false,
+    }
+}
+
+/// The enum instantiated over `lifetime` and `arguments`, which is the enum
+/// itself when it neither borrows nor carries schemas.
+fn instantiate<T: ToTokens>(
+    name: &Ident,
+    lifetime: Option<&TokenStream>,
+    arguments: &[T],
+) -> TokenStream {
+    match (lifetime, arguments.is_empty()) {
+        (None, true) => quote!(#name),
+        (None, false) => quote!(#name<#(#arguments),*>),
+        (Some(lifetime), true) => quote!(#name<#lifetime>),
+        (Some(lifetime), false) => quote!(#name<#lifetime, #(#arguments),*>),
     }
 }
 
@@ -1292,11 +1783,20 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
     let Choice {
         visibility,
         name,
+        lifetime,
         params,
         variants,
     } = parsed;
     let source = format_ident!("__{}Source", name);
     let declaration = declaration(item, params);
+
+    // An enum that borrows is written in terms of the lifetime it declares, so
+    // every instantiation below gives that lifetime whatever it stands for
+    // there: the buffer a view borrows from, and nothing in particular where
+    // the enum is only being named.
+    let declared = lifetime.map(|lifetime| quote!(#lifetime));
+    let buffer = lifetime.map(|_| quote!('buf));
+    let named = lifetime.map(|_| quote!('__schema));
 
     // The enum is instantiated three ways: over implementations of the schemas
     // it carries, which is what an encodable value is; over the names of those
@@ -1309,63 +1809,40 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
             quote!(#name: #schema)
         })
         .collect::<Vec<_>>();
-    let generics = if bounds.is_empty() {
-        TokenStream::new()
-    } else {
-        quote!(<#(#bounds),*>)
+    let generics = match (&declared, bounds.is_empty()) {
+        (None, true) => TokenStream::new(),
+        (None, false) => quote!(<#(#bounds),*>),
+        (Some(lifetime), true) => quote!(<#lifetime>),
+        (Some(lifetime), false) => quote!(<#lifetime, #(#bounds),*>),
     };
     let parameters = params.iter().map(|param| param.name).collect::<Vec<_>>();
-    let encodable = instantiate(name, &parameters);
+    let encodable = instantiate(name, declared.as_ref(), &parameters);
 
     let schemas = params
         .iter()
         .map(|param| schema_of(Nested::Message(param.schema)))
         .collect::<Vec<_>>();
-    let schema = instantiate(name, &schemas);
+    // The schema is named for any lifetime, so that naming it never has to name
+    // one: `Enum<'_, dyn Trait>` is the schema wherever it is written.
+    let schema_generics = named.as_ref().map(|named| quote!(<#named>));
+    let schema = instantiate(name, named.as_ref(), &schemas);
     let views = params
         .iter()
         .map(|param| view_of(Nested::Message(param.schema)))
         .collect::<Vec<_>>();
-    let view = instantiate(name, &views);
+    let view = instantiate(name, buffer.as_ref(), &views);
 
     let encoded = variants.iter().map(|variant| {
         let tag = Literal::u32_suffixed(variant.tag);
-        let pattern = pattern(name, variant, "__field");
+        let pattern = pattern(name, &variant.written, "__field");
         let payload = if variant.fields.is_empty() {
             TokenStream::new()
         } else {
-            // The payload's table is indexed by slot, so it is as long as the
-            // highest one the variant declares.
-            let slots = Literal::usize_suffixed(
-                variant
-                    .fields
-                    .iter()
-                    .map(|field| field.slot as usize + 1)
-                    .max()
-                    .expect("the variant has fields"),
-            );
+            let slots = table(variant.fields.iter().map(|field| field.slot));
+            let frame = format_ident!("__payload");
             let written = variant.fields.iter().enumerate().map(|(index, field)| {
-                let entry = Literal::usize_suffixed(field.slot as usize);
                 let binding = binding("__field", index);
-                let write = match &field.payload {
-                    Payload::Scalar(scalar) => {
-                        let write = format_ident!("write_{}", scalar);
-                        quote!(__writer.#write(*#binding);)
-                    }
-                    Payload::Nested(carried) => {
-                        let schema = schema_of(Nested::Message(carried.schema));
-                        quote! {
-                            <#schema as ::zerialize::Zerializable>::encode_source(
-                                #binding,
-                                __writer,
-                            );
-                        }
-                    }
-                };
-                quote! {
-                    __writer.begin_entry(&__payload, #entry);
-                    #write
-                }
+                write_payload(&field.payload, &frame, field.slot, &quote!(#binding))
             });
             quote! {
                 let __payload = __writer.begin_payload(&__frame, #slots);
@@ -1387,25 +1864,9 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
         let read = variant
             .fields
             .iter()
-            .map(|field| {
-                let slot = Literal::u32_suffixed(field.slot);
-                match &field.payload {
-                    Payload::Scalar(scalar) => {
-                        let read = format_ident!("read_{}", scalar);
-                        quote!(__payload.#read(#slot)?)
-                    }
-                    Payload::Nested(carried) => {
-                        let schema = schema_of(Nested::Message(carried.schema));
-                        quote! {
-                            <#schema as ::zerialize::Zerializable>::decode_view(
-                                __payload.read_message(#slot)?,
-                            )?
-                        }
-                    }
-                }
-            })
+            .map(|field| read_payload(&field.payload, field.slot))
             .collect::<Vec<_>>();
-        let built = construct(name, variant, &read);
+        let built = construct(name, &variant.written, &read);
         // A variant carrying nothing was written without a payload, so there is
         // none to read here either.
         if variant.fields.is_empty() {
@@ -1427,16 +1888,27 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
         .iter()
         .map(|param| format_ident!("__Other{}", param.name))
         .collect::<Vec<_>>();
-    let compared_generics = if params.is_empty() {
-        TokenStream::new()
-    } else {
+    // The enum a view holds borrows from the buffer, and the one it is compared
+    // against borrows from wherever it was built, so the two sides are named
+    // over their own lifetimes.
+    let other_lifetime = lifetime.map(|_| quote!('__other));
+    let compared_generics = {
         let bounds = params.iter().zip(&others).map(|(param, other)| {
             let (name, schema) = (param.name, param.schema);
             quote!(#name: #schema + ::core::cmp::PartialEq<#other>, #other: #schema)
         });
-        quote!(<#(#bounds),*>)
+        let lifetimes = declared.iter().chain(other_lifetime.iter());
+        let bounds = lifetimes
+            .map(|lifetime| quote!(#lifetime))
+            .chain(bounds)
+            .collect::<Vec<_>>();
+        if bounds.is_empty() {
+            TokenStream::new()
+        } else {
+            quote!(<#(#bounds),*>)
+        }
     };
-    let compared_to = instantiate(name, &others);
+    let compared_to = instantiate(name, other_lifetime.as_ref(), &others);
 
     // The enum over references to what it carries. A message hands out an enum
     // by value, since the enum a view holds is decided when it is read rather
@@ -1444,6 +1916,7 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
     // hands out one of its own without copying what it carries.
     let borrowed_to = instantiate(
         name,
+        declared.as_ref(),
         &params
             .iter()
             .map(|param| {
@@ -1453,22 +1926,17 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
             .collect::<Vec<_>>(),
     );
     let borrowed = variants.iter().map(|variant| {
-        let pattern = pattern(name, variant, "__field");
+        let pattern = pattern(name, &variant.written, "__field");
         let fields = variant
             .fields
             .iter()
             .enumerate()
             .map(|(index, field)| {
                 let binding = binding("__field", index);
-                match &field.payload {
-                    // A scalar is carried by value, so a reference to one is not
-                    // what the borrowed enum holds.
-                    Payload::Scalar(_) => quote!(*#binding),
-                    Payload::Nested(_) => quote!(#binding),
-                }
+                borrow_payload(&field.payload, &quote!(#binding))
             })
             .collect::<Vec<_>>();
-        let built = construct(name, variant, &fields);
+        let built = construct(name, &variant.written, &fields);
         quote!(#pattern => #built,)
     });
     let borrowing = format!(
@@ -1477,14 +1945,17 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
     );
     let compared = derived.partial_eq.then(|| {
         let arms = variants.iter().map(|variant| {
-            let mine = pattern(name, variant, "__field");
-            let theirs = pattern(name, variant, "__other");
-            let equal = (0..variant.fields.len()).map(|index| {
+            let mine = pattern(name, &variant.written, "__field");
+            let theirs = pattern(name, &variant.written, "__other");
+            let equal = variant.fields.iter().enumerate().map(|(index, field)| {
                 let (mine, theirs) = (binding("__field", index), binding("__other", index));
-                quote!(#mine == #theirs)
+                compare_payload(&field.payload, &quote!(#mine), &quote!(#theirs))
             });
             quote! {
-                (#mine, #theirs) => true #(&& #equal)*,
+                (#mine, #theirs) => {
+                    #(#equal)*
+                    true
+                }
             }
         });
         // A single variant leaves nothing for a catch all arm to match.
@@ -1536,7 +2007,7 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
             }
         }
 
-        impl ::zerialize::Zerializable for #schema {
+        impl #schema_generics ::zerialize::Zerializable for #schema {
             type Source<'src> = dyn #source + 'src;
             type View<'buf> = #view;
 
@@ -1559,6 +2030,18 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
                 }
             }
         }
+
+        // So that a list may hold this choice, as it holds any other schema.
+        impl #schema_generics ::zerialize::Element for #schema {
+            type Item<'buf> = #view;
+
+            fn decode_element<'buf>(
+                __list: ::zerialize::Message<'buf>,
+                __index: ::core::primitive::u32,
+            ) -> ::core::result::Result<Self::Item<'buf>, ::zerialize::Error> {
+                <Self as ::zerialize::Zerializable>::decode_view(__list.read_message(__index)?)
+            }
+        }
     }
 }
 
@@ -1576,16 +2059,27 @@ fn declaration(item: &ItemEnum, params: &[Param<'_>]) -> TokenStream {
     }
     for variant in &mut item.variants {
         for field in &mut variant.fields {
-            let carried = params
-                .iter()
-                .find(|param| matches!(&field.ty, Type::Path(path) if named(path) == Some(param.name)))
-                .map(|param| param.name);
-            if let Some(carried) = carried {
-                field.ty = parse_quote!(<#carried as ::zerialize::SchemaArg>::Value);
+            if let Some(carried) = carried_type(&field.ty, params) {
+                field.ty = carried;
             }
         }
     }
     item.into_token_stream()
+}
+
+/// A field's type with the parameter it carries rewritten to stand for what the
+/// enum is instantiated over, or `None` where the field carries no parameter.
+fn carried_type(ty: &Type, params: &[Param<'_>]) -> Option<Type> {
+    let Type::Path(path) = ty else {
+        return None;
+    };
+    if let Some(inner) = optional(path) {
+        let inner = carried_type(inner, params)?;
+        return Some(parse_quote!(::core::option::Option<#inner>));
+    }
+    let name = named(path)?;
+    let carried = params.iter().find(|param| param.name == name)?.name;
+    Some(parse_quote!(<#carried as ::zerialize::SchemaArg>::Value))
 }
 
 /// What a field is bound to when its variant is matched. A field is bound by
@@ -1598,27 +2092,27 @@ fn binding(prefix: &str, index: usize) -> Ident {
 /// One variant over whatever its fields are given, written the way it was
 /// declared. The same shape is both the expression building a variant and the
 /// pattern matching it, which is what lets one function write either.
-fn construct<T: ToTokens>(name: &Ident, variant: &Case<'_>, values: &[T]) -> TokenStream {
-    let variant_name = variant.name;
-    match variant.style {
-        Style::Unit => quote!(#name::#variant_name),
-        Style::Tuple => quote!(#name::#variant_name(#(#values),*)),
+fn construct<T: ToTokens>(name: &Ident, written: &Written<'_>, values: &[T]) -> TokenStream {
+    let variant = written.name;
+    match written.style {
+        Style::Unit => quote!(#name::#variant),
+        Style::Tuple => quote!(#name::#variant(#(#values),*)),
         Style::Named => {
-            let names = variant
+            let names = written
                 .fields
                 .iter()
-                .map(|field| field.name.expect("a named variant's fields are named"));
-            quote!(#name::#variant_name { #(#names: #values),* })
+                .map(|field| field.expect("a named variant's fields are named"));
+            quote!(#name::#variant { #(#names: #values),* })
         }
     }
 }
 
 /// The pattern matching one variant, binding every field it carries.
-fn pattern(name: &Ident, variant: &Case<'_>, prefix: &str) -> TokenStream {
-    let bindings = (0..variant.fields.len())
+fn pattern(name: &Ident, written: &Written<'_>, prefix: &str) -> TokenStream {
+    let bindings = (0..written.fields.len())
         .map(|index| binding(prefix, index))
         .collect::<Vec<_>>();
-    construct(name, variant, &bindings)
+    construct(name, written, &bindings)
 }
 
 // ============================================================
@@ -1635,12 +2129,15 @@ struct Value<'a> {
 enum Shape<'a> {
     /// As a frame of fields indexed by slot, exactly like a message.
     Struct(Vec<Field<'a>>),
-    /// As the number of the variant, which is all a unit variant carries.
+    /// As the number of the variant alone, where no variant carries fields, and
+    /// otherwise as a choice is: the number, and a frame of the fields it names.
     Enum(Vec<Variant<'a>>),
 }
 
 struct Field<'a> {
-    name: &'a Ident,
+    /// The field's own name, where what holds it gives it one: a struct's
+    /// fields are named, and a variant's are named where it names them.
+    name: Option<&'a Ident>,
     slot: u32,
     /// A value's fields are what a `Copy` type may hold: nothing that borrows.
     kind: FieldKind<'a>,
@@ -1649,11 +2146,14 @@ struct Field<'a> {
 enum FieldKind<'a> {
     Scalar(&'a Ident),
     Value(&'a Path),
+    /// A field that may be absent, written as `Option<..>`.
+    Optional(Box<FieldKind<'a>>),
 }
 
 struct Variant<'a> {
-    name: &'a Ident,
+    written: Written<'a>,
     number: u32,
+    fields: Vec<Field<'a>>,
 }
 
 fn parse_value(item: &DeriveInput) -> Result<Value<'_>, Error> {
@@ -1682,26 +2182,35 @@ fn parse_fields(data: &DataStruct) -> Result<Vec<Field<'_>>, Error> {
         Fields::Unnamed(fields) => return Err(Error::new_spanned(fields, NAMED)),
         Fields::Unit => return Err(Error::new_spanned(data.struct_token, NAMED)),
     };
+    parse_value_fields(fields, "struct")
+}
 
-    let mut parsed: Vec<Field<'_>> = Vec::new();
+/// Parses the fields of a value, which a struct and one variant of an enum
+/// declare alike.
+fn parse_value_fields<'a>(
+    fields: impl IntoIterator<Item = &'a syn::Field>,
+    holder: &str,
+) -> Result<Vec<Field<'a>>, Error> {
+    let mut parsed: Vec<Field<'a>> = Vec::new();
     for field in fields {
         let Some((slot, attribute)) = declared_number(&field.attrs, "n")? else {
             return Err(Error::new_spanned(
                 field,
-                "every field of a #[derive(Zerializable)] struct requires a #[n(N)] attribute",
+                format!(
+                    "every field of a #[derive(Zerializable)] {holder} requires a \
+                     #[n(N)] attribute"
+                ),
             ));
         };
-        if let Some(previous) = parsed.iter().find(|other| other.slot == slot) {
+        if let Some(index) = parsed.iter().position(|other| other.slot == slot) {
+            let previous = describe(parsed[index].name, index);
             return Err(Error::new_spanned(
                 attribute,
-                format!("slot {slot} is already used by `{}`", previous.name),
+                format!("slot {slot} is already used by {previous}"),
             ));
         }
         parsed.push(Field {
-            name: field
-                .ident
-                .as_ref()
-                .expect("named fields have an identifier"),
+            name: field.ident.as_ref(),
             slot,
             kind: parse_field_type(&field.ty)?,
         });
@@ -1711,14 +2220,19 @@ fn parse_fields(data: &DataStruct) -> Result<Vec<Field<'_>>, Error> {
 
 fn parse_field_type(ty: &Type) -> Result<FieldKind<'_>, Error> {
     match ty {
+        Type::Path(path) if optional(path).is_some() => {
+            let inner = parse_field_type(optional(path).expect("the path names an Option"))?;
+            require_not_optional(ty, matches!(inner, FieldKind::Optional(_)))?;
+            Ok(FieldKind::Optional(Box::new(inner)))
+        }
         Type::Path(path) if path.qself.is_none() => Ok(match scalar(path) {
             Some(scalar) => FieldKind::Scalar(scalar),
             None => FieldKind::Value(&path.path),
         }),
         _ => Err(Error::new_spanned(
             ty,
-            "unsupported field type: expected a scalar or another value type. A value is \
-             `Copy`, so it may not hold anything borrowed or owned",
+            "unsupported field type: expected a scalar, another value type, or an `Option` \
+             of either. A value is `Copy`, so it may not hold anything borrowed or owned",
         )),
     }
 }
@@ -1733,12 +2247,15 @@ fn parse_variants(data: &DataEnum) -> Result<Vec<Variant<'_>>, Error> {
 
     let mut parsed: Vec<Variant<'_>> = Vec::new();
     for variant in &data.variants {
-        if !matches!(variant.fields, Fields::Unit) {
+        if let Some((_, discriminant)) = &variant.discriminant {
             return Err(Error::new_spanned(
-                &variant.fields,
-                "#[derive(Zerializable)] enum variants may not hold data",
+                discriminant,
+                "#[derive(Zerializable)] variants may not have a discriminant: \
+                 what names a variant on the wire is its #[variant(N)]",
             ));
         }
+        let fields = parse_value_fields(&variant.fields, "variant")?;
+
         let Some((number, attribute)) = declared_number(&variant.attrs, "variant")? else {
             return Err(Error::new_spanned(
                 variant,
@@ -1749,12 +2266,16 @@ fn parse_variants(data: &DataEnum) -> Result<Vec<Variant<'_>>, Error> {
         if let Some(previous) = parsed.iter().find(|other| other.number == number) {
             return Err(Error::new_spanned(
                 attribute,
-                format!("variant {number} is already used by `{}`", previous.name),
+                format!(
+                    "variant {number} is already used by `{}`",
+                    previous.written.name
+                ),
             ));
         }
         parsed.push(Variant {
-            name: &variant.ident,
+            written: Written::new(variant),
             number,
+            fields,
         });
     }
     Ok(parsed)
@@ -1764,7 +2285,7 @@ fn generate_value(value: &Value<'_>) -> TokenStream {
     let Value { name, shape } = value;
     let (encode, decode) = match shape {
         Shape::Struct(fields) => generate_struct(fields),
-        Shape::Enum(variants) => generate_enum(variants),
+        Shape::Enum(variants) => generate_enum(name, variants),
     };
     quote! {
         impl ::zerialize::Value for #name {
@@ -1779,50 +2300,93 @@ fn generate_value(value: &Value<'_>) -> TokenStream {
                 #decode
             }
         }
+
+        // So that a list may hold this value. An element is addressed by its
+        // index exactly as a value is addressed by its slot, because a list and
+        // a message are the same frame.
+        impl ::zerialize::Element for #name {
+            type Item<'buf> = Self;
+
+            fn decode_element<'buf>(
+                __list: ::zerialize::Message<'buf>,
+                __index: ::core::primitive::u32,
+            ) -> ::core::result::Result<Self, ::zerialize::Error> {
+                <Self as ::zerialize::Value>::decode_value(__list, __index)
+            }
+        }
+    }
+}
+
+/// Writes one field of a value into the entry it occupies of the frame `frame`
+/// marks.
+fn write_value(kind: &FieldKind<'_>, frame: &Ident, slot: u32, value: &TokenStream) -> TokenStream {
+    if let FieldKind::Optional(inner) = kind {
+        let written = write_value(inner, frame, slot, &quote!(__some));
+        return quote! {
+            if let ::core::option::Option::Some(__some) = #value {
+                #written
+            }
+        };
+    }
+
+    let entry = Literal::usize_suffixed(slot as usize);
+    let write = match kind {
+        FieldKind::Scalar(scalar) => {
+            let write = format_ident!("write_{}", scalar);
+            quote!(__writer.#write(#value);)
+        }
+        FieldKind::Value(path) => quote! {
+            <#path as ::zerialize::Value>::encode_value(&#value, __writer);
+        },
+        FieldKind::Optional(_) => unreachable!("an optional field is written above"),
+    };
+    quote! {
+        __writer.begin_entry(&#frame, #entry);
+        #write
+    }
+}
+
+/// Reads one field of a value out of the frame it was written as, which `frame`
+/// names.
+fn read_value(kind: &FieldKind<'_>, frame: &Ident, slot: u32) -> TokenStream {
+    let entry = Literal::u32_suffixed(slot);
+    match kind {
+        FieldKind::Scalar(scalar) => {
+            let read = format_ident!("read_{}", scalar);
+            quote!(#frame.#read(#entry)?)
+        }
+        FieldKind::Value(path) => {
+            quote!(<#path as ::zerialize::Value>::decode_value(#frame, #entry)?)
+        }
+        FieldKind::Optional(inner) => {
+            let read = read_value(inner, frame, slot);
+            quote! {
+                if #frame.is_present(#entry)? {
+                    ::core::option::Option::Some(#read)
+                } else {
+                    ::core::option::Option::None
+                }
+            }
+        }
     }
 }
 
 /// A value struct is a frame, so it is read and written exactly as a message
 /// is, and gains and loses fields with the same consequences.
 fn generate_struct(fields: &[Field<'_>]) -> (TokenStream, TokenStream) {
-    let slots = Literal::usize_suffixed(
-        fields
-            .iter()
-            .map(|field| field.slot as usize + 1)
-            .max()
-            .unwrap_or(0),
-    );
+    let slots = table(fields.iter().map(|field| field.slot));
+    // The frame is begun below, and read back as the fields it holds.
+    let written_to = format_ident!("__frame");
+    let read_from = format_ident!("__fields");
 
     let written = fields.iter().map(|field| {
-        let entry = Literal::usize_suffixed(field.slot as usize);
-        let name = field.name;
-        let write = match &field.kind {
-            FieldKind::Scalar(scalar) => {
-                let write = format_ident!("write_{}", scalar);
-                quote!(__writer.#write(self.#name);)
-            }
-            FieldKind::Value(path) => quote! {
-                <#path as ::zerialize::Value>::encode_value(&self.#name, __writer);
-            },
-        };
-        quote! {
-            __writer.begin_entry(&__frame, #entry);
-            #write
-        }
+        let name = field.name.expect("a struct's fields are named");
+        write_value(&field.kind, &written_to, field.slot, &quote!(self.#name))
     });
 
     let read = fields.iter().map(|field| {
-        let slot = Literal::u32_suffixed(field.slot);
-        let name = field.name;
-        let read = match &field.kind {
-            FieldKind::Scalar(scalar) => {
-                let read = format_ident!("read_{}", scalar);
-                quote!(__fields.#read(#slot)?)
-            }
-            FieldKind::Value(path) => {
-                quote!(<#path as ::zerialize::Value>::decode_value(__fields, #slot)?)
-            }
-        };
+        let name = field.name.expect("a struct's fields are named");
+        let read = read_value(&field.kind, &read_from, field.slot);
         quote!(#name: #read,)
     });
 
@@ -1839,19 +2403,95 @@ fn generate_struct(fields: &[Field<'_>]) -> (TokenStream, TokenStream) {
     )
 }
 
-/// A value enum is its variant number and nothing else, so it costs a `u32`
-/// wherever it is held.
-fn generate_enum(variants: &[Variant<'_>]) -> (TokenStream, TokenStream) {
+/// A value enum whose variants carry nothing is its variant number and nothing
+/// else, so it costs a `u32` wherever it is held. One whose variants carry
+/// fields is written the way a choice is: the number naming the variant, and
+/// the frame of the fields that variant declares.
+fn generate_enum(name: &Ident, variants: &[Variant<'_>]) -> (TokenStream, TokenStream) {
+    if variants.iter().all(|variant| variant.fields.is_empty()) {
+        return generate_numbered(name, variants);
+    }
+
+    let frame = format_ident!("__payload");
     let written = variants.iter().map(|variant| {
-        let name = variant.name;
         let number = Literal::u32_suffixed(variant.number);
-        quote!(Self::#name => #number,)
+        let pattern = pattern(name, &variant.written, "__field");
+        let payload = if variant.fields.is_empty() {
+            TokenStream::new()
+        } else {
+            let slots = table(variant.fields.iter().map(|field| field.slot));
+            let written = variant.fields.iter().enumerate().map(|(index, field)| {
+                let binding = binding("__field", index);
+                write_value(&field.kind, &frame, field.slot, &quote!(*#binding))
+            });
+            quote! {
+                let __payload = __writer.begin_payload(&__frame, #slots);
+                #(#written)*
+                __writer.end_frame(__payload);
+            }
+        };
+        quote! {
+            #pattern => {
+                let __frame = __writer.begin_variant(#number);
+                #payload
+                __writer.end_frame(__frame);
+            }
+        }
     });
 
     let read = variants.iter().map(|variant| {
-        let name = variant.name;
         let number = Literal::u32_suffixed(variant.number);
-        quote!(#number => ::core::result::Result::Ok(Self::#name),)
+        let fields = variant
+            .fields
+            .iter()
+            .map(|field| read_value(&field.kind, &frame, field.slot))
+            .collect::<Vec<_>>();
+        let built = construct(name, &variant.written, &fields);
+        // A variant carrying nothing was written without a payload, so there is
+        // none to read here either.
+        if variant.fields.is_empty() {
+            return quote!(#number => ::core::result::Result::Ok(#built),);
+        }
+        quote! {
+            #number => {
+                let __payload = __variant.read_payload()?;
+                ::core::result::Result::Ok(#built)
+            }
+        }
+    });
+
+    (
+        quote! {
+            match self {
+                #(#written)*
+            }
+        },
+        quote! {
+            let __variant = __message.read_message(__slot)?;
+            match __variant.read_tag()? {
+                #(#read)*
+                _ => ::core::result::Result::Err(::zerialize::Error::UnknownVariant),
+            }
+        },
+    )
+}
+
+/// A value enum whose variants all carry nothing, written as the number naming
+/// the one it holds.
+fn generate_numbered(name: &Ident, variants: &[Variant<'_>]) -> (TokenStream, TokenStream) {
+    // A variant carrying nothing is still built and matched the way it was
+    // declared, since `V`, `V()`, and `V {}` are three declarations to Rust.
+    let nothing: [TokenStream; 0] = [];
+    let written = variants.iter().map(|variant| {
+        let pattern = pattern(name, &variant.written, "__field");
+        let number = Literal::u32_suffixed(variant.number);
+        quote!(#pattern => #number,)
+    });
+
+    let read = variants.iter().map(|variant| {
+        let built = construct(name, &variant.written, &nothing);
+        let number = Literal::u32_suffixed(variant.number);
+        quote!(#number => ::core::result::Result::Ok(#built),)
     });
 
     (
