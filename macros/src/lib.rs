@@ -47,7 +47,9 @@ use syn::{
 /// `impl List<Item = ..> + '_`. Everything named as an `impl Trait` must be
 /// declared `where Self: Sized` to keep `dyn Trait` usable as the schema's
 /// name. A value type, being `Copy`, is instead returned as itself: see
-/// [`macro@Zerializable`].
+/// [`macro@Zerializable`]. A value and an enum are named alike where a method
+/// returns one, `Stamp<'_>`, so which of the two a name stands for is which of
+/// them declared it.
 ///
 /// A list holds what a field holds, so `impl List<Item = u32> + '_` and
 /// `impl List<Item = &str> + '_` are lists as much as a list of messages is.
@@ -365,11 +367,21 @@ fn strip_variant_attributes(item: &mut ItemEnum) {
 /// names. Giving a variant its first field therefore changes what the enum
 /// encodes as, which readers built against the older one cannot read.
 ///
-/// Fields may be scalars, other values, or an `Option` of either, which is what
-/// keeps a value `Copy`: nothing it holds can borrow from the buffer it was read
-/// from, which is what separates a value enum from a choice. Nothing more is
-/// asked of the type, but a schema asked to print or compare its fields asks it
-/// of this one too, so a value a printed view carries must be `Debug`.
+/// Fields may be scalars, `&str`, `&[u8]`, other values, or an `Option` of any
+/// of them. A value that holds a borrowed field declares the lifetime it points
+/// into, `struct Stamp<'a> { .. }`, and is named with it wherever it is named,
+/// exactly as an enum that borrows is; a value that declares no lifetime holds
+/// nothing pointing into the buffer it was read from, and so outlives it. Both
+/// are `Copy`, which is what lets either be read out whole.
+///
+/// A value and an enum are written alike where a field names one, so which of
+/// the two a name stands for is which of them declared it rather than how the
+/// name is written: `Stamp<'a>` is a value where a `#[derive(Zerializable)]`
+/// declared it and a choice where a `#[zerializable]` enum did.
+///
+/// Nothing more is asked of the type, but a schema asked to print or compare
+/// its fields asks it of this one too, so a value a printed view carries must
+/// be `Debug`.
 #[proc_macro_derive(Zerializable, attributes(n, variant))]
 pub fn derive_zerializable(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let item = match syn::parse::<DeriveInput>(item) {
@@ -494,13 +506,13 @@ enum Payload<'a> {
     Str,
     /// A `&[u8]`, borrowed as a `&str` is.
     Bytes,
-    /// A `Copy` type held by value, named by its path.
-    Value(&'a Path),
     /// A nested message, carried by one of the enum's parameters.
     Nested(Param<'a>),
-    /// A nested enum, carried as itself: its payload is written in terms of
-    /// this enum's parameters, so one declaration instantiates with the other.
-    Choice(&'a TypePath),
+    /// A value or a nested enum, carried as itself. An enum is written over
+    /// this one's parameters, so one declaration instantiates with the other,
+    /// and which of the two a name stands for is which `Element` implementation
+    /// it has.
+    Named(&'a TypePath),
     /// A list, carried by one of the enum's parameters.
     Repeated(Param<'a>),
     /// A field that may be absent, written as `Option<..>`.
@@ -522,10 +534,13 @@ enum Kind<'a> {
     Bytes,
     /// A fixed width primitive, named by its Rust type.
     Scalar(&'a Ident),
-    /// A `Copy` type held by value, named by its path.
-    Value(&'a Path),
-    /// A nested schema.
-    Nested(Nested<'a>),
+    /// A message, returned as `impl Trait + '_` and named by that trait.
+    Message(&'a Path),
+    /// A value or a choice, named outright. Which of the two a name stands for
+    /// is which `Element` implementation it has, rather than how the name is
+    /// written: both are held by name, and both are read out of the entry their
+    /// slot numbers.
+    Named(&'a TypePath),
     /// A sequence of elements, each of whatever kind the list holds.
     Repeated(Box<Kind<'a>>),
     /// A field that may be absent, written as `Option<..>`. An absent field is
@@ -534,34 +549,12 @@ enum Kind<'a> {
     Optional(Box<Kind<'a>>),
 }
 
-/// A schema one method returns, named the way the method returns it.
-#[derive(Clone, Copy)]
-enum Nested<'a> {
-    /// A message, returned as `impl Trait + '_` and named by that trait.
-    Message(&'a Path),
-    /// An enum, returned as the enum instantiated over the schemas it carries,
-    /// `Enum<impl Trait + '_>`.
-    Choice(&'a TypePath),
-}
-
-/// Names a nested schema as `Zerializable` implements it.
-fn schema_of(nested: Nested<'_>) -> TokenStream {
-    match nested {
-        // The `'static` object lifetime that `impl Zerializable for dyn Trait`
-        // is written against is spelled out, because the default object
-        // lifetime in a return type is the one elided from `&self`.
-        Nested::Message(path) => quote!((dyn #path + 'static)),
-        // An enum names a schema by carrying their names, so each of its
-        // arguments is the schema that argument returns.
-        Nested::Choice(path) => carried_schemas(path).into_token_stream(),
-    }
-}
-
-/// The view type of another schema, named through its `Zerializable` impl so
-/// that nested schemas do not have to live in the same module.
-fn view_of(nested: Nested<'_>) -> TokenStream {
-    let schema = schema_of(nested);
-    quote!(<#schema as ::zerialize::Zerializable>::View<'buf>)
+/// Names a message as `Zerializable` implements it.
+fn schema_of(path: &Path) -> TokenStream {
+    // The `'static` object lifetime that `impl Zerializable for dyn Trait` is
+    // written against is spelled out, because the default object lifetime in a
+    // return type is the one elided from `&self`.
+    quote!((dyn #path + 'static))
 }
 
 /// The schema a parameter stands for, over `lifetime` where it needs one: a
@@ -569,7 +562,7 @@ fn view_of(nested: Nested<'_>) -> TokenStream {
 /// since a list is a handle over the buffer as a `&str` is.
 fn param_schema(param: &Param<'_>, lifetime: &TokenStream) -> TokenStream {
     match &param.carried {
-        Carried::Message(schema) => schema_of(Nested::Message(schema)),
+        Carried::Message(schema) => schema_of(schema),
         Carried::List(item) => {
             let element = element_of(item);
             quote!(::zerialize::ListView<#lifetime, #element>)
@@ -580,7 +573,10 @@ fn param_schema(param: &Param<'_>, lifetime: &TokenStream) -> TokenStream {
 /// What a parameter stands for once the enum is decoded.
 fn param_view(param: &Param<'_>) -> TokenStream {
     match &param.carried {
-        Carried::Message(schema) => view_of(Nested::Message(schema)),
+        Carried::Message(schema) => {
+            let schema = schema_of(schema);
+            quote!(<#schema as ::zerialize::Element>::Item<'buf>)
+        }
         Carried::List(item) => {
             let element = element_of(item);
             quote!(::zerialize::ListView<'buf, #element>)
@@ -611,12 +607,38 @@ fn held_bound(item: &Kind<'_>, lifetime: Option<&TokenStream>) -> TokenStream {
         Kind::Str => quote!(Item = &#lifetime ::core::primitive::str),
         Kind::Bytes => quote!(Item = &#lifetime [::core::primitive::u8]),
         Kind::Scalar(scalar) => quote!(Item = #scalar),
-        Kind::Value(path) => quote!(Item = #path),
-        Kind::Nested(Nested::Message(schema)) => quote!(Item: #schema),
-        Kind::Nested(Nested::Choice(_)) | Kind::Optional(_) | Kind::Repeated(_) => {
-            unreachable!("a list an enum carries holds none of these")
+        // A value is the same type wherever it is held, but a borrowed one is
+        // held over whichever buffer it was read from, so the lifetime it is
+        // named with is the one of the side being bound.
+        Kind::Named(path) => {
+            let item = over_lifetime(path, lifetime);
+            quote!(Item = #item)
+        }
+        Kind::Message(schema) => quote!(Item: #schema),
+        Kind::Optional(_) | Kind::Repeated(_) => {
+            unreachable!("a list holds neither an Option nor a list")
         }
     }
+}
+
+/// A name with every lifetime in it replaced by `lifetime`, which is what names
+/// one side of a comparison between two instantiations: each borrows from its
+/// own buffer.
+fn over_lifetime(path: &TypePath, lifetime: Option<&TokenStream>) -> TypePath {
+    let Some(lifetime) = lifetime else {
+        return path.clone();
+    };
+    let mut path = path.clone();
+    if let Some(segment) = path.path.segments.last_mut()
+        && let PathArguments::AngleBracketed(arguments) = &mut segment.arguments
+    {
+        for argument in &mut arguments.args {
+            if let GenericArgument::Lifetime(declared) = argument {
+                *declared = parse_quote!(#lifetime);
+            }
+        }
+    }
+    path
 }
 
 /// Whether a parameter carries a list, which the enum holds as it stands rather
@@ -625,9 +647,14 @@ fn is_list(param: &Param<'_>) -> bool {
     matches!(param.carried, Carried::List(_))
 }
 
-/// The enum with each schema it carries, written as `impl Trait + '_` where the
-/// method returns it, named as `Zerializable` implements it.
-fn carried_schemas(path: &TypePath) -> TypePath {
+/// A name a field is written with, as [`Element`] implements it: a value by its
+/// own name, and an enum over the schemas it carries, each of which is written
+/// as `impl Trait + '_` where a method returns it and as the parameter standing
+/// for it where an enum carries it.
+///
+/// A name is a name rather than a buffer, and stands for what a field holds
+/// however long that buffer lives, so every lifetime in it is `'static` here.
+fn element_name(path: &TypePath, params: &[Param<'_>]) -> TypePath {
     let mut path = path.clone();
     let Some(segment) = path.path.segments.last_mut() else {
         return path;
@@ -649,11 +676,16 @@ fn carried_schemas(path: &TypePath) -> TypePath {
                                 parse_quote!((dyn #schema + 'static))
                             }
                         };
+                    // An enum carrying an enum names it over its own
+                    // parameters, each of which stands for a schema here.
+                    } else if let Type::Path(carried) = ty
+                        && let Some(name) = named(carried)
+                        && let Some(param) = params.iter().find(|param| param.name == name)
+                    {
+                        let schema = param_schema(param, &quote!('static));
+                        *ty = parse_quote!(#schema);
                     }
                 }
-                // A schema is a name rather than a buffer, and is named for any
-                // lifetime, so the one an enum borrows from is spelled out here
-                // rather than left as the `'_` the method returning it wrote.
                 GenericArgument::Lifetime(lifetime) => *lifetime = parse_quote!('static),
                 _ => (),
             }
@@ -689,14 +721,15 @@ fn carries_schemas(path: &TypePath) -> bool {
     })
 }
 
-/// Whether a path names a schema declared as an enum rather than a value named
-/// outright, which is what its arguments say: an enum is named over the schemas
-/// it carries and the buffer it borrows from, and a value, being `Copy` and free
-/// of both, has neither.
-fn names_a_choice(path: &TypePath) -> bool {
+/// Whether a name carries a schema, which only an enum does: a value is `Copy`
+/// and holds nothing that a schema could be, so it is named over the buffer it
+/// borrows from and nothing else.
+fn carries_a_schema(path: &TypePath) -> bool {
     path.path.segments.last().is_some_and(|segment| {
         matches!(&segment.arguments, PathArguments::AngleBracketed(arguments)
-            if !arguments.args.is_empty())
+        if arguments.args.iter().any(|argument| {
+            matches!(argument, GenericArgument::Type(_))
+        }))
     })
 }
 
@@ -881,8 +914,9 @@ fn returns_impl_trait(kind: &Kind<'_>) -> bool {
     match kind {
         // An enum is a type rather than a trait, so it is only an `impl Trait`
         // where it carries one.
-        Kind::Nested(Nested::Choice(path)) => carries_schemas(path),
-        Kind::Nested(Nested::Message(_)) | Kind::Repeated(_) => true,
+        // A name is an `impl Trait` only where it carries one.
+        Kind::Named(path) => carries_schemas(path),
+        Kind::Message(_) | Kind::Repeated(_) => true,
         Kind::Optional(inner) => returns_impl_trait(inner),
         _ => false,
     }
@@ -979,15 +1013,13 @@ fn parse_return_type(ty: &Type) -> Result<Kind<'_>, Error> {
             require_not_optional(ty, matches!(inner, Kind::Optional(_)))?;
             Ok(Kind::Optional(Box::new(inner)))
         }
-        // A path carrying schemas is one declared as an enum, returned as
-        // itself rather than as `impl Trait` because an enum is a type and not
-        // a trait. Anything else named outright is a value: a
-        // `#[derive(Zerializable)]` type, which is returned as itself rather
-        // than as a view of the buffer.
+        // A name is a value or an enum, each of which is returned as itself
+        // rather than as `impl Trait` because both are types rather than
+        // traits. Which of the two it is, is which of them declared it: a
+        // value decodes back into itself, and an enum into the enum over views.
         Type::Path(path) if path.qself.is_none() => Ok(match scalar(path) {
             Some(scalar) => Kind::Scalar(scalar),
-            None if names_a_choice(path) => Kind::Nested(Nested::Choice(path)),
-            None => Kind::Value(&path.path),
+            None => Kind::Named(path),
         }),
         Type::ImplTrait(impl_trait) => {
             let bound = trait_bound(impl_trait)?;
@@ -999,7 +1031,7 @@ fn parse_return_type(ty: &Type) -> Result<Kind<'_>, Error> {
             if segment.ident == "List" {
                 Ok(Kind::Repeated(Box::new(parse_list_item(segment)?)))
             } else {
-                Ok(Kind::Nested(Nested::Message(&bound.path)))
+                Ok(Kind::Message(&bound.path))
             }
         }
         _ => Err(unsupported()),
@@ -1068,7 +1100,7 @@ fn parse_carried_item(list: &PathSegment) -> Result<Kind<'_>, Error> {
             GenericArgument::Constraint(item) if item.ident == "Item" => {
                 return match item.bounds.first() {
                     Some(TypeParamBound::Trait(bound)) if bound.maybe.is_none() => {
-                        Ok(Kind::Nested(Nested::Message(&bound.path)))
+                        Ok(Kind::Message(&bound.path))
                     }
                     _ => Err(Error::new_spanned(
                         item,
@@ -1130,19 +1162,20 @@ fn parse_item(ty: &Type) -> Result<Kind<'_>, Error> {
         Type::Path(path) if optional(path).is_some() => Ok(Kind::Optional(Box::new(parse_item(
             optional(path).expect("the path names an Option"),
         )?))),
-        // An enum is a type rather than a trait, so there is nothing to bound
-        // `Item` by that every instantiation of it satisfies. A message may hold
-        // the list instead, which holds its elements rather than standing for
-        // them.
-        Type::Path(path) if names_a_choice(path) => Err(Error::new_spanned(
+        // An enum carrying a schema is a different type on either side of a
+        // round trip, since what it carries is, so there is nothing to bound
+        // `Item` by that every instantiation of the enum holding the list
+        // satisfies. A message may hold that list instead, since it holds its
+        // elements rather than standing for them.
+        Type::Path(path) if carries_a_schema(path) => Err(Error::new_spanned(
             ty,
-            "a list a variant carries may not hold an enum: an enum is a type \
-             rather than a trait, so no bound names every instantiation of one. \
-             A view schema trait's list may hold one",
+            "a list a variant carries may not hold an enum over schemas: what \
+             that enum is, is not the same type on both sides of a round trip, \
+             so no bound names it. A view schema trait's list may hold one",
         )),
         Type::Path(path) if path.qself.is_none() => Ok(match scalar(path) {
             Some(scalar) => Kind::Scalar(scalar),
-            None => Kind::Value(&path.path),
+            None => Kind::Named(path),
         }),
         _ => Err(unsupported()),
     }
@@ -1284,9 +1317,15 @@ fn parse_param(param: &GenericParam, borrows: bool) -> Result<Param<'_>, Error> 
 }
 
 /// Whether the elements of a list point into the buffer, which is what the
-/// enum's lifetime stands for.
+/// enum's lifetime stands for. A value or an enum that borrows is named with
+/// that lifetime as an element exactly as it is as a field, so a list of them
+/// is written in terms of it too.
 fn borrowed_item(item: &Kind<'_>) -> bool {
-    matches!(item, Kind::Str | Kind::Bytes)
+    match item {
+        Kind::Str | Kind::Bytes => true,
+        Kind::Named(path) => borrows_from_a_lifetime(path),
+        _ => false,
+    }
 }
 
 /// Parses one variant, given the variants of the same enum already parsed,
@@ -1413,26 +1452,22 @@ fn parse_payload<'a>(
     if path.qself.is_some() {
         return Err(unsupported());
     }
-    // A path carrying schemas is one declared as an enum, carried as itself:
-    // written over this enum's parameters, it instantiates wherever this one
-    // does, and so is a value here, a name where this enum is named, and a view
-    // of the buffer once this one is decoded.
-    if names_a_choice(path) {
-        return Ok(Payload::Choice(path));
+    if let Some(name) = named(path) {
+        if let Some(param) = params.iter().find(|param| param.name == name) {
+            return Ok(match param.carried {
+                Carried::Message(_) => Payload::Nested(param.clone()),
+                Carried::List(_) => Payload::Repeated(param.clone()),
+            });
+        }
+        if SCALARS.iter().any(|scalar| name == scalar) {
+            return Ok(Payload::Scalar(name));
+        }
     }
-    let name = named(path).ok_or_else(unsupported)?;
-    if let Some(param) = params.iter().find(|param| param.name == name) {
-        Ok(match param.carried {
-            Carried::Message(_) => Payload::Nested(param.clone()),
-            Carried::List(_) => Payload::Repeated(param.clone()),
-        })
-    } else if SCALARS.iter().any(|scalar| name == scalar) {
-        Ok(Payload::Scalar(name))
-    // Anything else named outright is a value, exactly as it is where a method
-    // returns one: a `#[derive(Zerializable)]` type, carried by value.
-    } else {
-        Ok(Payload::Value(&path.path))
-    }
+    // Anything else named outright is a value or an enum, exactly as it is
+    // where a method returns one. An enum a variant carries is written over
+    // this enum's parameters, so one declaration instantiates wherever the
+    // other does.
+    Ok(Payload::Named(path))
 }
 
 // ============================================================
@@ -1471,21 +1506,21 @@ fn write_field(
             let write = format_ident!("write_{}", scalar);
             quote!(__writer.#write(#value);)
         }
-        Kind::Value(path) => quote! {
-            <#path as ::zerialize::Value>::encode_value(&#value, __writer);
-        },
-        Kind::Nested(nested) => {
-            let schema = schema_of(*nested);
+        // A message, a value, and an enum are written alike: each is one entry
+        // of this frame, and what it writes there is its own business.
+        Kind::Message(_) | Kind::Named(_) => {
+            let element = element_of(kind);
             quote! {
                 let __value = #value;
-                <#schema as ::zerialize::Zerializable>::encode_source(&__value, __writer);
+                <#element as ::zerialize::Element>::encode_element(&__value, __writer);
             }
         }
         // A list is a frame of its own, so an element is written into the entry
-        // it occupies exactly as a field is written into its slot.
+        // it occupies exactly as a field is written into its slot: by asking
+        // what it holds to write itself there.
         Kind::Repeated(item) => {
-            let list = format_ident!("__list");
-            let written = write_field(item, &list, &quote!(__index), &quote!(__item));
+            let element = element_of(item);
+            let source = element_source(item, &quote!(__item));
             quote! {
                 let __items = #value;
                 let __length = ::zerialize::List::len(&__items);
@@ -1493,7 +1528,8 @@ fn write_field(
                 for __index in 0..__length {
                     let __item = ::zerialize::List::get(&__items, __index)
                         .expect("List::get returned None below List::len");
-                    #written
+                    __writer.begin_entry(&__list, __index);
+                    <#element as ::zerialize::Element>::encode_element(#source, __writer);
                 }
                 __writer.end_frame(__list);
             }
@@ -1503,6 +1539,16 @@ fn write_field(
     quote! {
         __writer.begin_entry(&#frame, #entry);
         #write
+    }
+}
+
+/// What one element is handed to `Element::encode_element` as. The two elements
+/// that borrow are handles already, and every other is held by value, so a
+/// reference to it is what the source of it is.
+fn element_source(item: &Kind<'_>, held: &TokenStream) -> TokenStream {
+    match item {
+        Kind::Str | Kind::Bytes => quote!(#held),
+        _ => quote!(&#held),
     }
 }
 
@@ -1519,16 +1565,17 @@ fn table(slots: impl Iterator<Item = u32>) -> Literal {
     Literal::usize_suffixed(slots.map(|slot| slot as usize + 1).max().unwrap_or(0))
 }
 
-/// Names what a list holds, as [`::zerialize::Element`] is implemented for it:
-/// a schema by the name of the schema, a value by its own name, and a primitive
-/// by what it is, which for the two that borrow is what they point at.
-fn element_of(item: &Kind<'_>) -> TokenStream {
-    match item {
+/// Names what an entry holds, as [`::zerialize::Element`] is implemented for it:
+/// a message by the name of the schema, a value or an enum by its own name, and
+/// a primitive by what it is, which for the two that borrow is what they point
+/// at.
+fn element_of(kind: &Kind<'_>) -> TokenStream {
+    match kind {
         Kind::Str => quote!(::core::primitive::str),
         Kind::Bytes => quote!([::core::primitive::u8]),
         Kind::Scalar(scalar) => quote!(#scalar),
-        Kind::Value(path) => quote!(#path),
-        Kind::Nested(nested) => schema_of(*nested),
+        Kind::Message(schema) => schema_of(schema),
+        Kind::Named(path) => element_name(path, &[]).into_token_stream(),
         Kind::Optional(_) | Kind::Repeated(_) => {
             unreachable!("a list holds neither an Option nor a list")
         }
@@ -1542,8 +1589,10 @@ fn view_type(kind: &Kind<'_>) -> TokenStream {
         Kind::Str => quote!(&'buf str),
         Kind::Bytes => quote!(&'buf [u8]),
         Kind::Scalar(scalar) => quote!(#scalar),
-        Kind::Value(path) => quote!(#path),
-        Kind::Nested(nested) => view_of(*nested),
+        Kind::Message(_) | Kind::Named(_) => {
+            let element = element_of(kind);
+            quote!(<#element as ::zerialize::Element>::Item<'buf>)
+        }
         Kind::Repeated(item) => {
             let element = element_of(item);
             quote!(::zerialize::ListView<'buf, #element>)
@@ -1566,16 +1615,11 @@ fn read_field(kind: &Kind<'_>, slot: u32) -> TokenStream {
             let read = format_ident!("read_{}", scalar);
             quote!(__message.#read(#entry).expect(#VALIDATED))
         }
-        Kind::Value(path) => quote! {
-            <#path as ::zerialize::Value>::decode_value(__message, #entry).expect(#VALIDATED)
-        },
-        Kind::Nested(nested) => {
-            let schema = schema_of(*nested);
+        Kind::Message(_) | Kind::Named(_) => {
+            let element = element_of(kind);
             quote! {
-                <#schema as ::zerialize::Zerializable>::decode_view(
-                    __message.read_message(#entry).expect(#VALIDATED),
-                )
-                .expect(#VALIDATED)
+                <#element as ::zerialize::Element>::decode_element(__message, #entry)
+                    .expect(#VALIDATED)
             }
         }
         Kind::Repeated(_) => quote!(__message.read_list(#entry).expect(#VALIDATED)),
@@ -1603,16 +1647,9 @@ fn check_field(kind: &Kind<'_>, slot: u32) -> TokenStream {
             let read = format_ident!("read_{}", scalar);
             quote!(__message.#read(#entry)?;)
         }
-        Kind::Value(path) => {
-            quote!(<#path as ::zerialize::Value>::decode_value(__message, #entry)?;)
-        }
-        Kind::Nested(nested) => {
-            let schema = schema_of(*nested);
-            quote! {
-                <#schema as ::zerialize::Zerializable>::decode_view(
-                    __message.read_message(#entry)?,
-                )?;
-            }
+        Kind::Message(_) | Kind::Named(_) => {
+            let element = element_of(kind);
+            quote!(<#element as ::zerialize::Element>::decode_element(__message, #entry)?;)
         }
         Kind::Repeated(item) => {
             let element = element_of(item);
@@ -1863,10 +1900,19 @@ fn generate_schema(schema: &Schema<'_>, derived: Derived) -> TokenStream {
             }
         }
 
-        // So that a list may hold this schema. A list is a frame, so an
-        // element is read out of it the way a field is read out of a message.
+        // So that a field or an element may hold this schema. A message and a
+        // list are the same frame, so both are one entry of the one holding
+        // them, indexed by slot or by position.
         impl ::zerialize::Element for dyn #name {
+            type Source<'src> = dyn #source + 'src;
             type Item<'buf> = #view<'buf>;
+
+            fn encode_element<'src>(
+                __source: &'src Self::Source<'src>,
+                __writer: &mut ::zerialize::Writer,
+            ) {
+                <Self as ::zerialize::Zerializable>::encode_source(__source, __writer)
+            }
 
             fn decode_element<'buf>(
                 __list: ::zerialize::Message<'buf>,
@@ -1918,19 +1964,18 @@ fn write_payload(
         }
         Payload::Str => quote!(__writer.write_str(#binding);),
         Payload::Bytes => quote!(__writer.write_bytes(#binding);),
-        Payload::Value(path) => quote! {
-            <#path as ::zerialize::Value>::encode_value(#binding, __writer);
-        },
+        // A message, a value, and an enum are written alike: each is one entry
+        // of the payload frame, and what it writes there is its own business.
         Payload::Nested(carried) => {
-            let schema = carried_schema(carried);
+            let element = carried_schema(carried);
             quote! {
-                <#schema as ::zerialize::Zerializable>::encode_source(#binding, __writer);
+                <#element as ::zerialize::Element>::encode_element(#binding, __writer);
             }
         }
-        Payload::Choice(path) => {
-            let schema = choice_schema(path, params);
+        Payload::Named(path) => {
+            let element = element_name(path, params);
             quote! {
-                <#schema as ::zerialize::Zerializable>::encode_source(#binding, __writer);
+                <#element as ::zerialize::Element>::encode_element(#binding, __writer);
             }
         }
         Payload::Repeated(_) => unreachable!("a list is written above"),
@@ -1947,7 +1992,7 @@ fn carried_schema(param: &Param<'_>) -> TokenStream {
     let Carried::Message(schema) = &param.carried else {
         unreachable!("a nested field carries a message");
     };
-    schema_of(Nested::Message(schema))
+    schema_of(schema)
 }
 
 /// What the list a parameter carries holds.
@@ -1956,35 +2001,6 @@ fn carried_item<'a>(param: &'a Param<'_>) -> &'a Kind<'a> {
         unreachable!("a repeated field carries a list");
     };
     item
-}
-
-/// The schema a nested enum names, which is that enum over the schemas this
-/// one's parameters stand for: a field written `Reachable<P>` is carried as
-/// itself, and named `Reachable<dyn Person>`.
-fn choice_schema(path: &TypePath, params: &[Param<'_>]) -> TokenStream {
-    let mut path = path.clone();
-    if let Some(segment) = path.path.segments.last_mut()
-        && let PathArguments::AngleBracketed(arguments) = &mut segment.arguments
-    {
-        for argument in &mut arguments.args {
-            match argument {
-                GenericArgument::Type(ty) => {
-                    if let Type::Path(carried) = ty
-                        && let Some(name) = named(carried)
-                        && let Some(param) = params.iter().find(|param| param.name == name)
-                    {
-                        let schema = param_schema(param, &quote!('static));
-                        *ty = parse_quote!(#schema);
-                    }
-                }
-                // A schema is a name rather than a buffer, and is named for any
-                // lifetime, exactly as the enum holding it is.
-                GenericArgument::Lifetime(lifetime) => *lifetime = parse_quote!('static),
-                _ => (),
-            }
-        }
-    }
-    path.into_token_stream()
 }
 
 /// Reads what a variant carries out of `__payload`, which is where reading a
@@ -1998,24 +2014,13 @@ fn read_payload(payload: &Payload<'_>, params: &[Param<'_>], slot: u32) -> Token
         }
         Payload::Str => quote!(__payload.read_str(#entry)?),
         Payload::Bytes => quote!(__payload.read_bytes(#entry)?),
-        Payload::Value(path) => {
-            quote!(<#path as ::zerialize::Value>::decode_value(__payload, #entry)?)
-        }
         Payload::Nested(carried) => {
-            let schema = carried_schema(carried);
-            quote! {
-                <#schema as ::zerialize::Zerializable>::decode_view(
-                    __payload.read_message(#entry)?,
-                )?
-            }
+            let element = carried_schema(carried);
+            quote!(<#element as ::zerialize::Element>::decode_element(__payload, #entry)?)
         }
-        Payload::Choice(path) => {
-            let schema = choice_schema(path, params);
-            quote! {
-                <#schema as ::zerialize::Zerializable>::decode_view(
-                    __payload.read_message(#entry)?,
-                )?
-            }
+        Payload::Named(path) => {
+            let element = element_name(path, params);
+            quote!(<#element as ::zerialize::Element>::decode_element(__payload, #entry)?)
         }
         Payload::Repeated(param) => {
             let element = element_of(carried_item(param));
@@ -2038,24 +2043,22 @@ fn read_payload(payload: &Payload<'_>, params: &[Param<'_>], slot: u32) -> Token
 /// borrowed, and a scalar, which is carried by value, is copied.
 fn borrow_payload(payload: &Payload<'_>, binding: &TokenStream) -> TokenStream {
     match payload {
-        // A scalar and a value are carried by value, and a borrowed field is
-        // already a handle, so a reference to one is not what the borrowed enum
-        // holds.
-        Payload::Scalar(_) | Payload::Str | Payload::Bytes | Payload::Value(_) => {
-            quote!(*#binding)
-        }
+        // A scalar is carried by value, and a borrowed field is already a
+        // handle, so a reference to one is not what the borrowed enum holds.
+        Payload::Scalar(_) | Payload::Str | Payload::Bytes => quote!(*#binding),
         Payload::Nested(_) | Payload::Repeated(_) => quote!(#binding),
-        // A nested enum hands out what it carries the same way, which is what
+        // A value and a nested enum are both handed out by asking them: a value
+        // copies itself, and an enum borrows what it carries, which is what
         // makes the enum holding it one over references too.
-        Payload::Choice(_) => quote!(#binding.as_ref()),
+        Payload::Named(_) => quote!(#binding.as_ref()),
         Payload::Optional(inner) => match &**inner {
             Payload::Nested(_) | Payload::Repeated(_) => {
                 quote!(::core::option::Option::as_ref(#binding))
             }
-            Payload::Choice(_) => quote! {
+            Payload::Named(_) => quote! {
                 ::core::option::Option::map(
                     ::core::option::Option::as_ref(#binding),
-                    |__nested| __nested.as_ref(),
+                    |__held| __held.as_ref(),
                 )
             },
             _ => quote!(*#binding),
@@ -2101,9 +2104,9 @@ fn carries(payload: &Payload<'_>, param: &Param<'_>) -> bool {
         Payload::Nested(by) | Payload::Repeated(by) => by.name == param.name,
         // A nested enum is written over this one's parameters, so it carries
         // whichever of them it is named with.
-        Payload::Choice(path) => carried_by(path, param),
+        Payload::Named(path) => carried_by(path, param),
         Payload::Optional(inner) => carries(inner, param),
-        Payload::Scalar(_) | Payload::Str | Payload::Bytes | Payload::Value(_) => false,
+        Payload::Scalar(_) | Payload::Str | Payload::Bytes => false,
     }
 }
 
@@ -2126,11 +2129,11 @@ fn borrows(payload: &Payload<'_>) -> bool {
         // A list is bound by what it holds, so it is written in terms of the
         // enum's lifetime exactly where its elements point into the buffer.
         Payload::Repeated(param) => borrowed_item(carried_item(param)),
-        // A nested enum is named with the lifetime it borrows from, which is
-        // the one the enum holding it declares.
-        Payload::Choice(path) => borrows_from_a_lifetime(path),
+        // A value and a nested enum are each named with the lifetime they
+        // borrow from, which is the one the enum holding them declares.
+        Payload::Named(path) => borrows_from_a_lifetime(path),
         Payload::Optional(inner) => borrows(inner),
-        Payload::Scalar(_) | Payload::Value(_) | Payload::Nested(_) => false,
+        Payload::Scalar(_) | Payload::Nested(_) => false,
     }
 }
 
@@ -2450,9 +2453,19 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
             }
         }
 
-        // So that a list may hold this choice, as it holds any other schema.
+        // So that a field or an element may hold this choice, as either holds
+        // any other schema. This is also what tells a name that is an enum from
+        // one that is a value, since a field holding either is written alike.
         impl #schema_generics ::zerialize::Element for #schema {
+            type Source<'src> = dyn #source + 'src;
             type Item<'buf> = #view;
+
+            fn encode_element<'src>(
+                __source: &'src Self::Source<'src>,
+                __writer: &mut ::zerialize::Writer,
+            ) {
+                <Self as ::zerialize::Zerializable>::encode_source(__source, __writer)
+            }
 
             fn decode_element<'buf>(
                 __list: ::zerialize::Message<'buf>,
@@ -2567,8 +2580,54 @@ fn pattern(name: &Ident, written: &Written<'_>, prefix: &str) -> TokenStream {
 
 /// A `Copy` type a schema holds by value.
 struct Value<'a> {
+    visibility: &'a Visibility,
     name: &'a Ident,
+    /// The lifetime its borrowed fields point into, where it has any. Only a
+    /// value that borrows declares one, and only such a value is named with
+    /// one, so a value that declares none outlives the buffer it was read from.
+    lifetime: Option<&'a Lifetime>,
     shape: Shape<'a>,
+}
+
+impl<'a> Shape<'a> {
+    /// Every field the value holds, whichever shape holds them.
+    fn fields(&self) -> Box<dyn Iterator<Item = &Field<'a>> + '_> {
+        match self {
+            Shape::Struct(fields) => Box::new(fields.iter()),
+            Shape::Enum(variants) => Box::new(variants.iter().flat_map(|variant| &variant.fields)),
+        }
+    }
+
+    /// Whether any field of the value points into the buffer, which is what its
+    /// lifetime stands for.
+    fn borrows(&self) -> bool {
+        self.fields().map(|field| &field.kind).any(borrowed_field)
+    }
+
+    /// Every value this one holds by name.
+    fn held(&self) -> impl Iterator<Item = &'a TypePath> + '_ {
+        self.fields().filter_map(|field| held_value(&field.kind))
+    }
+}
+
+/// The value a field holds by name, where that is what it holds.
+fn held_value<'a>(kind: &FieldKind<'a>) -> Option<&'a TypePath> {
+    match kind {
+        FieldKind::Value(path) => Some(path),
+        FieldKind::Optional(inner) => held_value(inner),
+        FieldKind::Scalar(_) | FieldKind::Str | FieldKind::Bytes => None,
+    }
+}
+
+/// Whether one field of a value points into the buffer.
+fn borrowed_field(kind: &FieldKind<'_>) -> bool {
+    match kind {
+        FieldKind::Str | FieldKind::Bytes => true,
+        // A value holding a borrowed value is named over the same buffer.
+        FieldKind::Value(path) => borrows_from_a_lifetime(path),
+        FieldKind::Optional(inner) => borrowed_field(inner),
+        FieldKind::Scalar(_) => false,
+    }
 }
 
 /// How a value is written where the message that holds it has left room for it.
@@ -2585,13 +2644,20 @@ struct Field<'a> {
     /// fields are named, and a variant's are named where it names them.
     name: Option<&'a Ident>,
     slot: u32,
-    /// A value's fields are what a `Copy` type may hold: nothing that borrows.
+    /// A value's fields are what a `Copy` type may hold: nothing owned, and
+    /// nothing borrowed beyond what the buffer it was read from holds.
     kind: FieldKind<'a>,
 }
 
 enum FieldKind<'a> {
     Scalar(&'a Ident),
-    Value(&'a Path),
+    /// A `&str`, which points into the buffer rather than being copied out of
+    /// it, and so is written in terms of the value's lifetime.
+    Str,
+    /// A `&[u8]`, borrowed as a `&str` is.
+    Bytes,
+    /// Another value, named by its path.
+    Value(&'a TypePath),
     /// A field that may be absent, written as `Option<..>`.
     Optional(Box<FieldKind<'a>>),
 }
@@ -2603,10 +2669,11 @@ struct Variant<'a> {
 }
 
 fn parse_value(item: &DeriveInput) -> Result<Value<'_>, Error> {
-    require_no_generics(&item.generics, "#[derive(Zerializable)] types")?;
+    let lifetime = parse_value_lifetime(&item.generics)?;
+    let borrows = lifetime.is_some();
     let shape = match &item.data {
-        Data::Struct(data) => Shape::Struct(parse_fields(data)?),
-        Data::Enum(data) => Shape::Enum(parse_variants(data)?),
+        Data::Struct(data) => Shape::Struct(parse_fields(data, borrows)?),
+        Data::Enum(data) => Shape::Enum(parse_variants(data, borrows)?),
         Data::Union(data) => {
             return Err(Error::new_spanned(
                 data.union_token,
@@ -2614,13 +2681,71 @@ fn parse_value(item: &DeriveInput) -> Result<Value<'_>, Error> {
             ));
         }
     };
+
+    // A lifetime nothing borrows from would leave the value with a parameter it
+    // does not use, which is not a legal type. It is also what says a value
+    // outlives the buffer it was read from: one that declares no lifetime holds
+    // nothing pointing into it.
+    if let Some(lifetime) = lifetime
+        && !shape.borrows()
+    {
+        return Err(Error::new_spanned(
+            lifetime,
+            format!("no field borrows from `{lifetime}`"),
+        ));
+    }
+
     Ok(Value {
+        visibility: &item.vis,
         name: &item.ident,
+        lifetime,
         shape,
     })
 }
 
-fn parse_fields(data: &DataStruct) -> Result<Vec<Field<'_>>, Error> {
+/// The one lifetime a value may declare, which is the buffer its borrowed
+/// fields point into. Nothing a value holds is generic, so a type parameter is
+/// not something it can have.
+fn parse_value_lifetime(generics: &Generics) -> Result<Option<&Lifetime>, Error> {
+    if let Some(where_clause) = &generics.where_clause {
+        return Err(Error::new_spanned(
+            where_clause,
+            "#[derive(Zerializable)] types may not have a where clause",
+        ));
+    }
+    let mut lifetime = None;
+    for param in &generics.params {
+        match param {
+            GenericParam::Lifetime(declared) if lifetime.is_none() => {
+                if !declared.bounds.is_empty() {
+                    return Err(Error::new_spanned(
+                        &declared.bounds,
+                        "a #[derive(Zerializable)] type's lifetime may not have bounds: it \
+                         is the buffer its borrowed fields point into",
+                    ));
+                }
+                lifetime = Some(&declared.lifetime);
+            }
+            GenericParam::Lifetime(declared) => {
+                return Err(Error::new_spanned(
+                    declared,
+                    "a #[derive(Zerializable)] type may declare one lifetime, which is the \
+                     buffer every borrowed field of it points into",
+                ));
+            }
+            _ => {
+                return Err(Error::new_spanned(
+                    param,
+                    "#[derive(Zerializable)] types may not have generic parameters, beside \
+                     the one lifetime their borrowed fields point into",
+                ));
+            }
+        }
+    }
+    Ok(lifetime)
+}
+
+fn parse_fields(data: &DataStruct, borrows: bool) -> Result<Vec<Field<'_>>, Error> {
     const NAMED: &str = "#[derive(Zerializable)] structs must have named fields, \
                          each declaring the slot it occupies";
     let fields = match &data.fields {
@@ -2628,7 +2753,7 @@ fn parse_fields(data: &DataStruct) -> Result<Vec<Field<'_>>, Error> {
         Fields::Unnamed(fields) => return Err(Error::new_spanned(fields, NAMED)),
         Fields::Unit => return Err(Error::new_spanned(data.struct_token, NAMED)),
     };
-    parse_value_fields(fields, "struct")
+    parse_value_fields(fields, "struct", borrows)
 }
 
 /// Parses the fields of a value, which a struct and one variant of an enum
@@ -2636,6 +2761,7 @@ fn parse_fields(data: &DataStruct) -> Result<Vec<Field<'_>>, Error> {
 fn parse_value_fields<'a>(
     fields: impl IntoIterator<Item = &'a syn::Field>,
     holder: &str,
+    borrows: bool,
 ) -> Result<Vec<Field<'a>>, Error> {
     let mut parsed: Vec<Field<'a>> = Vec::new();
     for field in fields {
@@ -2658,32 +2784,65 @@ fn parse_value_fields<'a>(
         parsed.push(Field {
             name: field.ident.as_ref(),
             slot,
-            kind: parse_field_type(&field.ty)?,
+            kind: parse_field_type(&field.ty, borrows)?,
         });
     }
     Ok(parsed)
 }
 
-fn parse_field_type(ty: &Type) -> Result<FieldKind<'_>, Error> {
+fn parse_field_type(ty: &Type, borrows: bool) -> Result<FieldKind<'_>, Error> {
+    let unsupported = || {
+        Error::new_spanned(
+            ty,
+            "unsupported field type: expected a scalar, `&str`, `&[u8]`, another value \
+             type, or an `Option` of any of them. A value is `Copy`, so it may not hold \
+             anything owned",
+        )
+    };
+
+    // A borrowed field points into the buffer the value was read from, which is
+    // what the value's lifetime stands for, so a value that declares one may
+    // hold them and a value that does not may not. That is what keeps a value
+    // declaring no lifetime one that outlives the buffer.
+    if let Type::Reference(reference) = ty
+        && reference.mutability.is_none()
+    {
+        if !borrows {
+            return Err(Error::new_spanned(
+                ty,
+                "a value carrying a borrowed field needs to declare the lifetime it points \
+                 into, `struct Name<'a> { .. }`, and to write the field as `&'a str` or \
+                 `&'a [u8]`",
+            ));
+        }
+        return match &*reference.elem {
+            Type::Path(path) if named(path).is_some_and(|name| name == "str") => Ok(FieldKind::Str),
+            Type::Slice(slice) => match &*slice.elem {
+                Type::Path(path) if named(path).is_some_and(|name| name == "u8") => {
+                    Ok(FieldKind::Bytes)
+                }
+                _ => Err(unsupported()),
+            },
+            _ => Err(unsupported()),
+        };
+    }
+
     match ty {
         Type::Path(path) if optional(path).is_some() => {
-            let inner = parse_field_type(optional(path).expect("the path names an Option"))?;
+            let inner =
+                parse_field_type(optional(path).expect("the path names an Option"), borrows)?;
             require_not_optional(ty, matches!(inner, FieldKind::Optional(_)))?;
             Ok(FieldKind::Optional(Box::new(inner)))
         }
         Type::Path(path) if path.qself.is_none() => Ok(match scalar(path) {
             Some(scalar) => FieldKind::Scalar(scalar),
-            None => FieldKind::Value(&path.path),
+            None => FieldKind::Value(path),
         }),
-        _ => Err(Error::new_spanned(
-            ty,
-            "unsupported field type: expected a scalar, another value type, or an `Option` \
-             of either. A value is `Copy`, so it may not hold anything borrowed or owned",
-        )),
+        _ => Err(unsupported()),
     }
 }
 
-fn parse_variants(data: &DataEnum) -> Result<Vec<Variant<'_>>, Error> {
+fn parse_variants(data: &DataEnum, borrows: bool) -> Result<Vec<Variant<'_>>, Error> {
     if data.variants.is_empty() {
         return Err(Error::new_spanned(
             data.enum_token,
@@ -2700,7 +2859,7 @@ fn parse_variants(data: &DataEnum) -> Result<Vec<Variant<'_>>, Error> {
                  what names a variant on the wire is its #[variant(N)]",
             ));
         }
-        let fields = parse_value_fields(&variant.fields, "variant")?;
+        let fields = parse_value_fields(&variant.fields, "variant", borrows)?;
 
         let Some((number, attribute)) = declared_number(&variant.attrs, "variant")? else {
             return Err(Error::new_spanned(
@@ -2728,36 +2887,81 @@ fn parse_variants(data: &DataEnum) -> Result<Vec<Variant<'_>>, Error> {
 }
 
 fn generate_value(value: &Value<'_>) -> TokenStream {
-    let Value { name, shape } = value;
+    let Value {
+        visibility,
+        name,
+        lifetime,
+        shape,
+    } = value;
     let (encode, decode) = match shape {
-        Shape::Struct(fields) => generate_struct(fields),
+        Shape::Struct(fields) => generate_struct(name, fields),
         Shape::Enum(variants) => generate_enum(name, variants),
     };
-    quote! {
-        impl ::zerialize::Value for #name {
-            fn encode_value(&self, __writer: &mut ::zerialize::Writer) {
-                #encode
-            }
 
-            fn decode_value(
-                __message: ::zerialize::Message<'_>,
-                __slot: ::core::primitive::u32,
-            ) -> ::core::result::Result<Self, ::zerialize::Error> {
-                #decode
+    // A value that borrows is written in terms of the lifetime it declares, so
+    // every instantiation below gives that lifetime whatever it stands for
+    // there: the buffer it was read from, and nothing in particular where the
+    // value is only being named. A value that borrows nothing is named as it
+    // was declared, and so outlives every buffer.
+    let declared = lifetime.map(|lifetime| quote!(<#lifetime>));
+    let generics = lifetime.map(|lifetime| quote!(<#lifetime>));
+    let source = lifetime.map(|_| quote!(<'src>));
+    let decoded = lifetime.map(|_| quote!(<'buf>));
+
+    let borrowing = format!(
+        "Copies the value, so that an enum carrying a `{name}` hands it out as \
+         it hands out the schemas it carries."
+    );
+
+    // What a name a field is written with stands for is which implementation of
+    // `Element` it has, which is what lets a value and an enum be written
+    // alike. A value's own fields are values, though, and nothing about the
+    // name says so, so this is where that is asked: an enum reaches a schema
+    // through a view, and a value holds only what it can be read out whole
+    // with.
+    let held = shape.held().map(|path| {
+        let held = element_name(path, &[]);
+        quote! {
+            const _: fn() = || {
+                fn __zerialize_holds_a_value<__V: ::zerialize::Value>() {}
+                __zerialize_holds_a_value::<#held>();
+            };
+        }
+    });
+
+    quote! {
+        #(#held)*
+
+        impl #generics ::zerialize::Value for #name #declared {}
+
+        #[allow(dead_code)]
+        impl #generics #name #declared {
+            #[doc = #borrowing]
+            #visibility fn as_ref(&self) -> Self {
+                *self
             }
         }
 
-        // So that a list may hold this value. An element is addressed by its
-        // index exactly as a value is addressed by its slot, because a list and
-        // a message are the same frame.
-        impl ::zerialize::Element for #name {
-            type Item<'buf> = Self;
+        // So that a field or an element may hold this value. A message and a
+        // list are the same frame, so a value is one entry of either, indexed
+        // by slot or by position.
+        impl #generics ::zerialize::Element for #name #declared {
+            type Source<'src> = #name #source;
+            type Item<'buf> = #name #decoded;
+
+            fn encode_element<'src>(
+                __source: &'src Self::Source<'src>,
+                __writer: &mut ::zerialize::Writer,
+            ) {
+                let __value = __source;
+                #encode
+            }
 
             fn decode_element<'buf>(
-                __list: ::zerialize::Message<'buf>,
-                __index: ::core::primitive::u32,
-            ) -> ::core::result::Result<Self, ::zerialize::Error> {
-                <Self as ::zerialize::Value>::decode_value(__list, __index)
+                __message: ::zerialize::Message<'buf>,
+                __slot: ::core::primitive::u32,
+            ) -> ::core::result::Result<Self::Item<'buf>, ::zerialize::Error> {
+                #decode
             }
         }
     }
@@ -2781,9 +2985,14 @@ fn write_value(kind: &FieldKind<'_>, frame: &Ident, slot: u32, value: &TokenStre
             let write = format_ident!("write_{}", scalar);
             quote!(__writer.#write(#value);)
         }
-        FieldKind::Value(path) => quote! {
-            <#path as ::zerialize::Value>::encode_value(&#value, __writer);
-        },
+        FieldKind::Str => quote!(__writer.write_str(#value);),
+        FieldKind::Bytes => quote!(__writer.write_bytes(#value);),
+        FieldKind::Value(path) => {
+            let element = element_name(path, &[]);
+            quote! {
+                <#element as ::zerialize::Element>::encode_element(&#value, __writer);
+            }
+        }
         FieldKind::Optional(_) => unreachable!("an optional field is written above"),
     };
     quote! {
@@ -2801,8 +3010,11 @@ fn read_value(kind: &FieldKind<'_>, frame: &Ident, slot: u32) -> TokenStream {
             let read = format_ident!("read_{}", scalar);
             quote!(#frame.#read(#entry)?)
         }
+        FieldKind::Str => quote!(#frame.read_str(#entry)?),
+        FieldKind::Bytes => quote!(#frame.read_bytes(#entry)?),
         FieldKind::Value(path) => {
-            quote!(<#path as ::zerialize::Value>::decode_value(#frame, #entry)?)
+            let element = element_name(path, &[]);
+            quote!(<#element as ::zerialize::Element>::decode_element(#frame, #entry)?)
         }
         FieldKind::Optional(inner) => {
             let read = read_value(inner, frame, slot);
@@ -2819,7 +3031,7 @@ fn read_value(kind: &FieldKind<'_>, frame: &Ident, slot: u32) -> TokenStream {
 
 /// A value struct is a frame, so it is read and written exactly as a message
 /// is, and gains and loses fields with the same consequences.
-fn generate_struct(fields: &[Field<'_>]) -> (TokenStream, TokenStream) {
+fn generate_struct(name: &Ident, fields: &[Field<'_>]) -> (TokenStream, TokenStream) {
     let slots = table(fields.iter().map(|field| field.slot));
     // The frame is begun below, and read back as the fields it holds.
     let written_to = format_ident!("__frame");
@@ -2827,7 +3039,7 @@ fn generate_struct(fields: &[Field<'_>]) -> (TokenStream, TokenStream) {
 
     let written = fields.iter().map(|field| {
         let name = field.name.expect("a struct's fields are named");
-        write_value(&field.kind, &written_to, field.slot, &quote!(self.#name))
+        write_value(&field.kind, &written_to, field.slot, &quote!(__value.#name))
     });
 
     let read = fields.iter().map(|field| {
@@ -2844,7 +3056,7 @@ fn generate_struct(fields: &[Field<'_>]) -> (TokenStream, TokenStream) {
         },
         quote! {
             let __fields = __message.read_message(__slot)?;
-            ::core::result::Result::Ok(Self { #(#read)* })
+            ::core::result::Result::Ok(#name { #(#read)* })
         },
     )
 }
@@ -2908,7 +3120,7 @@ fn generate_enum(name: &Ident, variants: &[Variant<'_>]) -> (TokenStream, TokenS
 
     (
         quote! {
-            match self {
+            match __value {
                 #(#written)*
             }
         },
@@ -2942,7 +3154,7 @@ fn generate_numbered(name: &Ident, variants: &[Variant<'_>]) -> (TokenStream, To
 
     (
         quote! {
-            __writer.write_u32(match self { #(#written)* });
+            __writer.write_u32(match __value { #(#written)* });
         },
         quote! {
             match __message.read_u32(__slot)? {

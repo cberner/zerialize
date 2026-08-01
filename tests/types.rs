@@ -342,8 +342,9 @@ fn a_char_that_is_not_a_scalar_value_is_rejected() {
 // Primitives, as the fields of a value and of a choice
 // ============================================================
 
-/// Every primitive a value may hold: a value is `Copy`, so `&str` and `&[u8]`,
-/// which borrow from the buffer, are not among them.
+/// Every primitive a value that declares no lifetime may hold: `&str` and
+/// `&[u8]` point into the buffer, so they belong to a value that declares the
+/// one they point into.
 #[derive(Zerializable, Copy, Clone, Debug, PartialEq)]
 struct Scalars {
     #[n(0)]
@@ -2185,4 +2186,369 @@ fn corrupt_enums_carrying_enums_never_panic() {
             }
         }
     }
+}
+
+// ============================================================
+// A value that borrows from the buffer
+// ============================================================
+
+/// A value carrying borrowed fields, which is what its lifetime stands for: the
+/// buffer they point into. A value is `Copy` either way, and one that declares
+/// no lifetime holds nothing pointing into a buffer, so it outlives the one it
+/// was read from.
+#[derive(Zerializable, Copy, Clone, Debug, PartialEq)]
+struct Stamp<'a> {
+    #[n(0)]
+    code: &'a str,
+    #[n(1)]
+    seal: &'a [u8],
+    #[n(2)]
+    grams: u32,
+    #[n(3)]
+    note: Option<&'a str>,
+}
+
+/// A value holding a value that borrows, which points into the same buffer.
+#[derive(Zerializable, Copy, Clone, Debug, PartialEq)]
+struct Franked<'a> {
+    #[n(0)]
+    stamp: Stamp<'a>,
+    #[n(1)]
+    second: Option<Stamp<'a>>,
+}
+
+/// A value enum whose variants borrow, which is a value like any other.
+#[derive(Zerializable, Copy, Clone, Debug, PartialEq)]
+enum Mark<'a> {
+    #[variant(0)]
+    Printed(#[n(0)] &'a str),
+    #[variant(1)]
+    Stamped {
+        #[n(0)]
+        stamp: Stamp<'a>,
+    },
+    #[variant(2)]
+    Blank,
+}
+
+/// A borrowed value in each of the places a value may appear, beside the choice
+/// that is written exactly as one: a name with a lifetime and nothing else is a
+/// value or an enum, and which of the two it is, is which of them declared it.
+#[zerializable(derive(Debug, PartialEq))]
+trait Franking {
+    #[n(0)]
+    fn stamp(&self) -> Stamp<'_>;
+
+    #[n(1)]
+    fn franked(&self) -> Franked<'_>;
+
+    #[n(2)]
+    fn mark(&self) -> Mark<'_>;
+
+    #[n(3)]
+    fn maybe(&self) -> Option<Stamp<'_>>;
+
+    #[n(4)]
+    fn stamps(&self) -> impl List<Item = Stamp<'_>> + '_
+    where
+        Self: Sized;
+
+    #[n(5)]
+    fn title(&self) -> Label<'_>;
+
+    #[n(6)]
+    fn weight(&self) -> Weight;
+}
+
+#[derive(Debug)]
+struct OwnedFranking {
+    stamps: OwnedList<Stamp<'static>>,
+}
+
+const STAMP: Stamp<'static> = Stamp {
+    code: "AB12",
+    seal: &[1, 2, 3],
+    grams: 5,
+    note: Some("fragile"),
+};
+
+const BLANK: Stamp<'static> = Stamp {
+    code: "",
+    seal: &[],
+    grams: 0,
+    note: None,
+};
+
+impl Franking for OwnedFranking {
+    fn stamp(&self) -> Stamp<'_> {
+        STAMP
+    }
+
+    fn franked(&self) -> Franked<'_> {
+        Franked {
+            stamp: STAMP,
+            second: Some(BLANK),
+        }
+    }
+
+    fn mark(&self) -> Mark<'_> {
+        Mark::Stamped { stamp: STAMP }
+    }
+
+    fn maybe(&self) -> Option<Stamp<'_>> {
+        Some(BLANK)
+    }
+
+    fn stamps(&self) -> impl List<Item = Stamp<'_>> + '_
+    where
+        Self: Sized,
+    {
+        Copied(&self.stamps)
+    }
+
+    fn title(&self) -> Label<'_> {
+        Label::Text("parcel")
+    }
+
+    fn weight(&self) -> Weight {
+        Weight { grams: 500 }
+    }
+}
+
+fn franking() -> OwnedFranking {
+    OwnedFranking {
+        stamps: vec![STAMP, BLANK].into(),
+    }
+}
+
+#[test]
+fn a_message_holds_values_that_borrow() {
+    let source = franking();
+    let encoded = encode::<dyn Franking>(&source);
+    let view = decode::<dyn Franking>(&encoded).unwrap();
+
+    assert_eq!(view.stamp(), STAMP);
+    assert_eq!(view.stamp().note, Some("fragile"));
+    assert_eq!(view.franked().second, Some(BLANK));
+    assert_eq!(view.mark(), Mark::Stamped { stamp: STAMP });
+    assert_eq!(view.maybe(), Some(BLANK));
+    assert_eq!(view.stamps().iter().collect::<Vec<_>>(), [STAMP, BLANK]);
+    // A name with a lifetime and nothing else is a value or an enum, and both
+    // are read out of the entry their slot numbers.
+    assert_eq!(view.title(), Label::Text("parcel"));
+    assert_eq!(view.weight(), Weight { grams: 500 });
+
+    assert_eq!(view, source);
+    assert_eq!(encode::<dyn Franking>(&view), encoded);
+}
+
+#[test]
+fn a_borrowed_field_of_a_value_points_into_the_buffer() {
+    let encoded = encode::<dyn Franking>(&franking());
+    let view = decode::<dyn Franking>(&encoded).unwrap();
+    let buffer = encoded.as_ptr() as usize..encoded.as_ptr() as usize + encoded.len();
+
+    assert!(buffer.contains(&(view.stamp().code.as_ptr() as usize)));
+    assert!(buffer.contains(&(view.stamp().seal.as_ptr() as usize)));
+    assert!(buffer.contains(&(view.franked().stamp.code.as_ptr() as usize)));
+    assert!(buffer.contains(&(view.stamps().get(0).unwrap().code.as_ptr() as usize)));
+    match view.mark() {
+        Mark::Stamped { stamp } => {
+            assert!(buffer.contains(&(stamp.code.as_ptr() as usize)))
+        }
+        _ => panic!("decoded the wrong variant"),
+    }
+}
+
+#[test]
+fn a_value_that_borrows_nothing_still_outlives_the_buffer() {
+    // The value read here is held past the buffer it was read from, which only
+    // a value declaring no lifetime can be.
+    let weight = {
+        let encoded = encode::<dyn Franking>(&franking());
+        decode::<dyn Franking>(&encoded).unwrap().weight()
+    };
+    assert_eq!(weight, Weight { grams: 500 });
+}
+
+/// A view enum carrying values that borrow, beside a nested enum written the
+/// same way and a list of them.
+#[zerializable(derive(PartialEq))]
+#[derive(Debug)]
+enum Posted<'a, C: Contact, L: List<Item = Stamp<'a>>> {
+    #[variant(0)]
+    By(#[n(0)] C),
+    #[variant(1)]
+    With {
+        #[n(0)]
+        stamp: Stamp<'a>,
+        #[n(1)]
+        label: Label<'a>,
+    },
+    #[variant(2)]
+    Many(#[n(0)] L),
+    #[variant(3)]
+    Maybe(#[n(0)] Option<Stamp<'a>>),
+}
+
+type PostedSchema<'a> = Posted<'a, dyn Contact, ListView<'a, Stamp<'static>>>;
+
+type OwnedPosted<'a> = Posted<'a, &'a OwnedContact, Copied<&'a OwnedList<Stamp<'a>>>>;
+
+fn posted<'a>(contact: &'a OwnedContact, stamps: &'a OwnedList<Stamp<'a>>) -> [OwnedPosted<'a>; 5] {
+    [
+        Posted::By(contact),
+        Posted::With {
+            stamp: STAMP,
+            label: Label::Text("hello"),
+        },
+        Posted::Many(Copied(stamps)),
+        Posted::Maybe(Some(BLANK)),
+        Posted::Maybe(None),
+    ]
+}
+
+#[test]
+fn a_variant_holds_values_that_borrow() {
+    let contact = OwnedContact("Ada".to_string());
+    let stamps: OwnedList<Stamp<'_>> = vec![STAMP, BLANK].into();
+    for source in posted(&contact, &stamps) {
+        let encoded = encode::<PostedSchema<'_>>(&source);
+        let decoded = decode::<PostedSchema<'_>>(&encoded).unwrap();
+
+        assert_eq!(decoded, source);
+        assert_eq!(encode::<PostedSchema<'_>>(&decoded), encoded);
+        assert_eq!(encode::<PostedSchema<'_>>(&source.as_ref()), encoded);
+    }
+
+    let encoded = encode::<PostedSchema<'_>>(&posted(&contact, &stamps)[1]);
+    match decode::<PostedSchema<'_>>(&encoded).unwrap() {
+        Posted::With { stamp, label } => {
+            assert_eq!(stamp, STAMP);
+            assert_eq!(label, Label::Text("hello"));
+        }
+        _ => panic!("decoded the wrong variant"),
+    }
+
+    let encoded = encode::<PostedSchema<'_>>(&posted(&contact, &stamps)[2]);
+    match decode::<PostedSchema<'_>>(&encoded).unwrap() {
+        Posted::Many(stamps) => assert_eq!(stamps.get(1).unwrap(), BLANK),
+        _ => panic!("decoded the wrong variant"),
+    }
+}
+
+#[test]
+fn corrupt_values_that_borrow_never_panic() {
+    let encoded = encode::<dyn Franking>(&franking());
+    for index in 0..encoded.len() {
+        for bit in [0x01, 0x40, 0x80] {
+            let mut corrupted = encoded.clone();
+            corrupted[index] ^= bit;
+            let Ok(view) = decode::<dyn Franking>(&corrupted) else {
+                continue;
+            };
+            let _ = view.stamp();
+            let _ = view.franked();
+            let _ = view.mark();
+            let _ = view.maybe();
+            let _ = view.title();
+            let _ = view.weight();
+            for stamp in view.stamps().iter() {
+                let _ = stamp;
+            }
+        }
+    }
+}
+
+/// Value evolution: `after` gains a borrowed field, which an older writer's
+/// message does not have.
+mod stamp_before {
+    use zerialize::Zerializable;
+
+    #[derive(Zerializable, Copy, Clone, Debug, PartialEq)]
+    pub struct Stamp<'a> {
+        #[n(0)]
+        pub code: &'a str,
+    }
+}
+
+mod stamp_after {
+    use zerialize::Zerializable;
+
+    #[derive(Zerializable, Copy, Clone, Debug, PartialEq)]
+    pub struct Stamp<'a> {
+        #[n(0)]
+        pub code: &'a str,
+        #[n(1)]
+        pub note: Option<&'a str>,
+    }
+}
+
+#[zerializable(derive(Debug, PartialEq))]
+trait Franked1 {
+    #[n(0)]
+    fn stamp(&self) -> stamp_before::Stamp<'_>;
+}
+
+#[zerializable(derive(Debug, PartialEq))]
+trait Franked2 {
+    #[n(0)]
+    fn stamp(&self) -> stamp_after::Stamp<'_>;
+}
+
+struct OwnedFranked1;
+
+impl Franked1 for OwnedFranked1 {
+    fn stamp(&self) -> stamp_before::Stamp<'_> {
+        stamp_before::Stamp { code: "AB12" }
+    }
+}
+
+#[test]
+fn a_borrowed_field_added_to_a_value_reads_as_absent() {
+    let encoded = encode::<dyn Franked1>(&OwnedFranked1);
+    assert_eq!(
+        decode::<dyn Franked2>(&encoded).unwrap().stamp(),
+        stamp_after::Stamp {
+            code: "AB12",
+            note: None,
+        }
+    );
+}
+
+/// A view enum whose only borrowed data is a list of values that borrow: what
+/// the elements point into is the lifetime it declares, as it is for a field
+/// holding one directly.
+#[zerializable(derive(PartialEq))]
+#[derive(Debug)]
+enum Bag<'a, L: List<Item = Stamp<'a>>> {
+    #[variant(0)]
+    Many(#[n(0)] L),
+    #[variant(1)]
+    Empty,
+}
+
+#[test]
+fn a_list_of_values_that_borrow_is_what_a_lifetime_stands_for() {
+    type Schema<'a> = Bag<'a, ListView<'a, Stamp<'static>>>;
+
+    let stamps: OwnedList<Stamp<'_>> = vec![STAMP, BLANK].into();
+    let many: Bag<'_, Copied<&OwnedList<Stamp<'_>>>> = Bag::Many(Copied(&stamps));
+    let encoded = encode::<Schema<'_>>(&many);
+    let decoded = decode::<Schema<'_>>(&encoded).unwrap();
+
+    match &decoded {
+        Bag::Many(stamps) => {
+            assert_eq!(stamps.get(0).unwrap(), STAMP);
+            let buffer = encoded.as_ptr() as usize..encoded.as_ptr() as usize + encoded.len();
+            assert!(buffer.contains(&(stamps.get(0).unwrap().code.as_ptr() as usize)));
+        }
+        Bag::Empty => panic!("decoded the wrong variant"),
+    }
+    assert_eq!(decoded, many);
+    assert_eq!(encode::<Schema<'_>>(&many.as_ref()), encoded);
+
+    let empty: Bag<'_, Copied<&OwnedList<Stamp<'_>>>> = Bag::Empty;
+    let encoded = encode::<Schema<'_>>(&empty);
+    assert_eq!(decode::<Schema<'_>>(&encoded).unwrap(), empty);
 }

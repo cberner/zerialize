@@ -31,10 +31,9 @@ Containers may contain any primitive, value type, view trait, or view enum. An `
 a list; `Option<Option<T>>`, a list of `Option<T>`, and a list of lists are not supported.
 
 ### Value types
-Value types are copied, and may be structs or enums, without generic parameters. They must implement
-`Copy`, and hold nothing borrowed: a `&str` field belongs to a view schema trait or a view enum.
-A value enum's variants may carry fields of their own, each declaring its slot as a struct's fields
-do.
+Value types are copied, and may be structs or enums, without generic parameters beside the one
+lifetime their borrowed fields point into. They must implement `Copy`. A value enum's variants may
+carry fields of their own, each declaring its slot as a struct's fields do.
 For example:
 ```rust
 #[derive(Zerializable, Copy, Clone)]
@@ -64,8 +63,26 @@ enum Protocol {
 }
 ```
 
-Value types may only contain primitives that are not borrowed, other value types, and an `Option`
-of either. They may not contain `&str`, `&[u8]`, lists, view traits, or view enums.
+A value may hold `&str` and `&[u8]`, which point into the buffer as the same fields of a view schema
+trait do. One that does declares the lifetime it points into, and is named with it wherever it is
+named, as a view enum that borrows is.
+```rust
+#[derive(Zerializable, Copy, Clone)]
+struct Stamp<'a> {
+    #[n(0)]
+    code: &'a str,
+    #[n(1)]
+    grams: u32,
+}
+```
+Only a value that borrows declares a lifetime, so a value that declares none holds nothing pointing
+into the buffer it was read from, and outlives it.
+
+Value types may contain primitives, other value types, and an `Option` of either. They may not
+contain lists, view traits, or view enums.
+
+A value type and a view enum are written alike where a field names one, `Stamp<'_>`, so which of the
+two a name stands for is which of them declared it.
 
 ### View schema traits
 View traits provide zero copy access to their data. A method that returns an `impl Trait` must be

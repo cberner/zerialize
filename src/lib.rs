@@ -43,11 +43,11 @@
 //! # Values
 //!
 //! A `Copy` struct or enum annotated with [`macro@Zerializable`] is a *value*:
-//! a field type that decodes back to itself rather than to a view, because
-//! there is nothing in it that could borrow from the buffer. A value enum's
-//! variants may carry fields of their own, as the struct beside them does; what
-//! separates a value from a choice is that a value holds nothing borrowed, and
-//! so is read out whole.
+//! a field type that decodes back to itself rather than to a view, because it
+//! is read out whole rather than a field at a time. A value enum's variants may
+//! carry fields of their own, as the struct beside them does; what separates a
+//! value from a choice is that a value is `Copy`, and so is handed back as
+//! itself.
 //!
 //! ```
 //! use zerialize::{Zerializable, decode, encode, zerializable};
@@ -86,6 +86,45 @@
 //! let bytes = encode::<dyn Reading>(&reading);
 //! assert_eq!(decode::<dyn Reading>(&bytes).unwrap().temperature(), reading.0);
 //! ```
+//!
+//! A value may hold `&str` and `&[u8]`, which point into the buffer as the same
+//! fields of a message do. One that does declares the lifetime it points into,
+//! and is named with that lifetime wherever it is named:
+//!
+//! ```
+//! use zerialize::{Zerializable, decode, encode, zerializable};
+//!
+//! #[derive(Zerializable, Copy, Clone, Debug, PartialEq)]
+//! struct Stamp<'a> {
+//!     #[n(0)]
+//!     code: &'a str,
+//!     #[n(1)]
+//!     grams: u32,
+//! }
+//!
+//! #[zerializable]
+//! trait Parcel {
+//!     #[n(0)]
+//!     fn stamp(&self) -> Stamp<'_>;
+//! }
+//!
+//! # struct OwnedParcel;
+//! # impl Parcel for OwnedParcel {
+//! #     fn stamp(&self) -> Stamp<'_> {
+//! #         Stamp { code: "AB12", grams: 5 }
+//! #     }
+//! # }
+//! let bytes = encode::<dyn Parcel>(&OwnedParcel);
+//! assert_eq!(decode::<dyn Parcel>(&bytes).unwrap().stamp().code, "AB12");
+//! ```
+//!
+//! Only a value that borrows declares a lifetime, so a value that declares none
+//! holds nothing pointing into the buffer it was read from, and outlives it.
+//! Either way it is `Copy`, which is what lets it be read out whole.
+//!
+//! A value and a choice are written alike where a field names one, so which of
+//! the two a name stands for is which of them declared it: `Stamp<'_>` is a
+//! value above, and would be a choice had a `#[zerializable]` enum declared it.
 //!
 //! # Optional fields
 //!
@@ -349,26 +388,20 @@ pub trait Zerializable {
 
 /// A field that decodes back into itself rather than into a view.
 ///
-/// A value is `Copy`, so nothing it holds can borrow from the buffer, which is
-/// what lets it be read out whole: a schema's accessor hands back the value
-/// itself, not a handle over the bytes it was read from. Nothing more is
-/// required of it: a schema asked to print or compare its fields needs this one
-/// to be `Debug` or `PartialEq`, but a schema that is asked for neither does
-/// not.
+/// A value is `Copy`, which is what lets it be read out whole: a schema's
+/// accessor hands back the value itself, not a handle over the bytes it was
+/// read from. A value that declares no lifetime holds nothing borrowed, and so
+/// outlives the buffer it was read from; one that declares a lifetime points
+/// into that buffer as a `&str` field of a schema does, and is `Copy` all the
+/// same. Nothing more is required of it: a schema asked to print or compare its
+/// fields needs this one to be `Debug` or `PartialEq`, but a schema that is
+/// asked for neither does not.
+///
+/// Reading and writing a value is [`Element`], which a value shares with the
+/// schemas and primitives a field may hold. This says what a value *is*.
 ///
 /// Implemented by `#[derive(Zerializable)]` on a `Copy` struct or enum.
-pub trait Value: Copy {
-    #[doc(hidden)]
-    fn encode_value(&self, writer: &mut Writer);
-
-    /// Decodes the value held by `slot` of `message`.
-    ///
-    /// A value is addressed by its slot rather than handed its bytes because it
-    /// chooses its own shape on the wire: a value enum is a scalar, a value
-    /// struct a message of its own.
-    #[doc(hidden)]
-    fn decode_value(message: Message<'_>, slot: u32) -> Result<Self, Error>;
-}
+pub trait Value: Copy {}
 
 /// Encodes `source` as the schema `S`.
 ///
