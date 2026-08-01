@@ -350,11 +350,20 @@
 mod list;
 mod wire;
 
+use std::fmt::{self, Display, Formatter};
+
 pub use list::{Copied, Element, List, ListIter, ListView, OwnedList};
 pub use wire::{FrameMark, Message, Writer};
 pub use zerialize_macros::{Zerializable, zerializable};
 
-#[derive(Debug, PartialEq, Eq)]
+/// Why a buffer could not be decoded as a schema.
+///
+/// Every variant describes the message rather than the reader: a buffer that
+/// fails to decode is one that no reader of this schema accepts. More ways for
+/// a message to be rejected may be named later, so a match on this needs a
+/// wildcard arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Error {
     UnexpectedEof,
     InvalidUtf8,
@@ -369,6 +378,24 @@ pub enum Error {
     /// gained a variant cannot be read by a reader built before it.
     UnknownVariant,
 }
+
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Error::UnexpectedEof => "message ended before a field it points at",
+            Error::InvalidUtf8 => "string field is not valid UTF-8",
+            Error::InvalidBool => "bool field is neither 0 nor 1",
+            Error::InvalidChar => "char field is not a Unicode scalar value",
+            Error::TrailingBytes => "bytes remain after the message",
+            Error::MissingField => "required field is absent",
+            Error::RecursionLimit => "message is nested deeper than the recursion limit",
+            Error::UnknownVariant => "enum tag names no variant of this schema",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for Error {}
 
 pub trait Zerializable {
     /// Types that may be encoded as this schema.
