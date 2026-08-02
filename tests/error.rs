@@ -7,7 +7,7 @@ use std::error::Error as StdError;
 
 use zerialize::{Error, decode, encode, zerializable};
 
-const ALL: [Error; 8] = [
+const ALL: [Error; 9] = [
     Error::UnexpectedEof,
     Error::InvalidUtf8,
     Error::InvalidBool,
@@ -15,6 +15,7 @@ const ALL: [Error; 8] = [
     Error::TrailingBytes,
     Error::MissingField,
     Error::RecursionLimit,
+    Error::InvalidFrame,
     Error::UnknownVariant,
 ];
 

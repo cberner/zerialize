@@ -1,7 +1,7 @@
 //! Sequences of elements.
 
 use crate::Error;
-use crate::wire::{Frame, Message, Writer};
+use crate::wire::{Frame, Message, Packing, Writer};
 use std::fmt::{self, Debug};
 use std::marker::PhantomData;
 
@@ -177,50 +177,129 @@ pub trait Element {
     /// wherever the element itself does.
     type Item<'buf>;
 
+    /// How a list packs this element, where every one of them is the same
+    /// size. A packed list holds its elements one after another rather than
+    /// through a table of offsets, so it costs no more than what it holds, and
+    /// reaching one is an index into them. An element that says it is packed
+    /// says how to read itself out of the bytes it begins at as well.
+    const PACKING: Option<Packing> = None;
+
     #[doc(hidden)]
     fn encode_element<'src>(source: &'src Self::Source<'src>, writer: &mut Writer<'_>);
 
+    /// Reads the entry at `index` of the frame holding it, which is a slot
+    /// where that frame is a message and a position where it is a list.
+    ///
+    /// This is how an element that is not packed is reached, and an element
+    /// that is not packed implements it. See [`Element::decode_packed`] for
+    /// the other half.
     #[doc(hidden)]
-    fn decode_element<'buf>(list: Message<'buf>, index: u32) -> Result<Self::Item<'buf>, Error>;
+    fn decode_element<'buf>(_list: Message<'buf>, _index: u32) -> Result<Self::Item<'buf>, Error> {
+        Err(Error::InvalidFrame)
+    }
+
+    /// Reads one element out of the bytes it begins at, which is where its
+    /// position times its width puts it.
+    ///
+    /// This is how a packed element is reached, and a packed element
+    /// implements it. [`Element::PACKING`] is what decides which of the two an
+    /// element is read by, so each implements the one it is read by and the
+    /// other is never called on it.
+    #[doc(hidden)]
+    fn decode_packed<'buf>(_bytes: &'buf [u8]) -> Result<Self::Item<'buf>, Error> {
+        Err(Error::InvalidFrame)
+    }
 }
 
-macro_rules! primitive_elements {
-    ($($ty:ty: $write:ident, $read:ident,)*) => {
+// A number is one width on the wire and any bytes of that width are one, so a
+// list of them is packed and needs no checking beyond its length.
+macro_rules! number_elements {
+    ($($ty:ty: $write:ident,)*) => {
         $(
             impl Element for $ty {
                 type Source<'src> = $ty;
                 type Item<'buf> = $ty;
 
+                const PACKING: Option<Packing> = Some(Packing {
+                    width: size_of::<$ty>() as u8,
+                    total: true,
+                });
+
                 fn encode_element(source: &$ty, writer: &mut Writer<'_>) {
                     writer.$write(*source);
                 }
 
-                fn decode_element<'buf>(
-                    list: Message<'buf>,
-                    index: u32,
-                ) -> Result<$ty, Error> {
-                    list.$read(index)
+                #[inline]
+                fn decode_packed(bytes: &[u8]) -> Result<$ty, Error> {
+                    let value = bytes
+                        .get(..size_of::<$ty>())
+                        .ok_or(Error::UnexpectedEof)?;
+                    Ok(<$ty>::from_le_bytes(
+                        value.try_into().expect("the slice is exactly sized"),
+                    ))
                 }
             }
         )*
     };
 }
 
-primitive_elements! {
-    bool: write_bool, read_bool,
-    char: write_char, read_char,
-    u8: write_u8, read_u8,
-    u16: write_u16, read_u16,
-    u32: write_u32, read_u32,
-    u64: write_u64, read_u64,
-    u128: write_u128, read_u128,
-    i8: write_i8, read_i8,
-    i16: write_i16, read_i16,
-    i32: write_i32, read_i32,
-    i64: write_i64, read_i64,
-    i128: write_i128, read_i128,
-    f32: write_f32, read_f32,
-    f64: write_f64, read_f64,
+number_elements! {
+    u8: write_u8,
+    u16: write_u16,
+    u32: write_u32,
+    u64: write_u64,
+    u128: write_u128,
+    i8: write_i8,
+    i16: write_i16,
+    i32: write_i32,
+    i64: write_i64,
+    i128: write_i128,
+    f32: write_f32,
+    f64: write_f64,
+}
+
+// The two primitives that are one width but not every pattern of it, so a
+// packed list of them is read element by element to be checked.
+impl Element for bool {
+    type Source<'src> = bool;
+    type Item<'buf> = bool;
+
+    const PACKING: Option<Packing> = Some(Packing {
+        width: 1,
+        total: false,
+    });
+
+    fn encode_element(source: &bool, writer: &mut Writer<'_>) {
+        writer.write_bool(*source);
+    }
+
+    #[inline]
+    fn decode_packed(bytes: &[u8]) -> Result<bool, Error> {
+        match bytes.first().ok_or(Error::UnexpectedEof)? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(Error::InvalidBool),
+        }
+    }
+}
+
+impl Element for char {
+    type Source<'src> = char;
+    type Item<'buf> = char;
+
+    const PACKING: Option<Packing> = Some(Packing {
+        width: size_of::<char>() as u8,
+        total: false,
+    });
+
+    fn encode_element(source: &char, writer: &mut Writer<'_>) {
+        writer.write_char(*source);
+    }
+
+    #[inline]
+    fn decode_packed(bytes: &[u8]) -> Result<char, Error> {
+        char::from_u32(u32::decode_packed(bytes)?).ok_or(Error::InvalidChar)
+    }
 }
 
 // The two elements that are read as handles over the buffer rather than copied
@@ -254,9 +333,10 @@ impl Element for [u8] {
 
 /// A list of encoded elements, each decoded when it is asked for.
 ///
-/// This is the bytes of one frame and nothing else, so it costs the same as a
-/// slice however many elements it covers, and reaching any one of them is an
-/// index into that frame's offset table.
+/// This is the bytes of one frame and what its header said about them, read
+/// where the list was reached rather than again at every element. Reaching any
+/// one of them is then an index into that frame's offset table, or, where the
+/// elements are all one width, into the elements themselves.
 pub struct ListView<'buf, E: ?Sized> {
     frame: Frame<'buf>,
     element: PhantomData<fn() -> *const E>,
@@ -302,17 +382,52 @@ impl<'buf, E: Element + ?Sized> List for ListView<'buf, E> {
         if index >= self.len() {
             return None;
         }
-        let index = Self::position(index)?;
         Some(
-            E::decode_element(self.as_message(0, false), index)
+            self.element(index)
                 .expect("elements are validated when the message is decoded"),
         )
     }
 }
 
 impl<'buf, E: Element + ?Sized> ListView<'buf, E> {
+    /// Reads the element at `index`, which the caller has already bounded.
+    ///
+    /// A packed element is where its position puts it, so reaching one is an
+    /// index into the elements themselves rather than a walk through the frame
+    /// holding them. Anything else is an entry of that frame, reached the way
+    /// a field of a message is.
+    #[inline]
+    fn element(&self, index: usize) -> Result<E::Item<'buf>, Error> {
+        match E::PACKING {
+            Some(packing) => {
+                let at = index * usize::from(packing.width);
+                let bytes = self
+                    .frame
+                    .elements()
+                    .get(at..)
+                    .ok_or(Error::UnexpectedEof)?;
+                E::decode_packed(bytes)
+            }
+            None => {
+                let index = Self::position(index).ok_or(Error::UnexpectedEof)?;
+                E::decode_element(self.as_message(0, false), index)
+            }
+        }
+    }
+
     /// Decodes every element, so that [`List::get`] cannot fail afterwards.
+    ///
+    /// A packed list of numbers never reaches here: reading the frame's header
+    /// already said every element is within it, and any bytes of their width
+    /// are one. What does reach here is a packed list of the two primitives
+    /// that is not true of, and every list that is not packed at all.
     pub(crate) fn validate(&self, depth: u32) -> Result<(), Error> {
+        if E::PACKING.is_some() {
+            for index in 0..self.len() {
+                self.element(index)?;
+            }
+            return Ok(());
+        }
         let list = self.as_message(depth, true);
         for index in 0..self.len() {
             let index = Self::position(index).ok_or(Error::UnexpectedEof)?;
