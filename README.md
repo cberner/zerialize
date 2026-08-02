@@ -158,6 +158,12 @@ carries the one above as `Pet(#[n(0)] Mammal<'a, P>)`.
 View enums may contain any primitive, container type, value type, view trait, or view enum, with one
 exception: a list a view enum carries may not hold a view enum. A view schema trait's list may.
 
+## Benchmarks
+
+`just bench` measures size and speed against [rkyv](https://rkyv.org) and
+[flatbuffers](https://flatbuffers.dev) over the same records. The results, and
+what is still left on the table, are in [benchmarks/README.md](benchmarks/README.md).
+
 ## License
 
 Licensed under either of

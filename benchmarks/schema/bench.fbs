@@ -1,0 +1,39 @@
+// FlatBuffers schema mirroring the shapes benchmarked against zerialize and
+// rkyv. Generated code is checked in as src/bench_generated.rs so that the
+// benchmarks build without flatc.
+
+namespace bench;
+
+struct Point {
+  x: float;
+  y: float;
+  z: float;
+}
+
+table PointTable {
+  x: float;
+  y: float;
+  z: float;
+}
+
+enum Status : byte { Active = 0, Idle = 1, Retired = 2 }
+
+table Person {
+  name: string;
+  id: ulong;
+  email: string;
+  status: Status;
+  scores: [uint];
+}
+
+table Team {
+  name: string;
+  members: [Person];
+}
+
+table Series {
+  name: string;
+  values: [double];
+}
+
+root_type Team;
