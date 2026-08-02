@@ -22,6 +22,12 @@ test: pre
 test_no_sandbox: pre_no_sandbox
     RUST_BACKTRACE=1 cargo test --frozen --all-features
 
+# The benchmarks are their own package, outside the workspace, so that rkyv and
+# flatbuffers stay out of the library's dependency graph.
+bench:
+    cargo run --manifest-path benchmarks/Cargo.toml --release --bin sizes
+    cargo bench --manifest-path benchmarks/Cargo.toml
+
 clear_podman_cache:
     podman volume rm --force zerialize-sandbox-target
 

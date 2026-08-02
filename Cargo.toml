@@ -1,5 +1,8 @@
 [workspace]
 members = ["macros"]
+# The benchmarks pull in rkyv and flatbuffers to compare against, which the
+# library itself has no business depending on. They are built by `just bench`.
+exclude = ["benchmarks"]
 
 [package]
 name = "zerialize"
