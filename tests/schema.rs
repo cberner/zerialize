@@ -410,7 +410,7 @@ trait Trumps {
 #[zerializable(derive(Debug, PartialEq))]
 trait Numbered {
     #[n(0)]
-    fn value(&self) -> u32;
+    fn value(&self) -> u8;
 }
 
 #[test]
@@ -424,13 +424,14 @@ fn a_value_enum_costs_what_its_number_costs() {
 
     struct Counted;
     impl Numbered for Counted {
-        fn value(&self) -> u32 {
+        fn value(&self) -> u8 {
             2
         }
     }
 
     // A variant number is all a unit variant carries, so an enum is written as
-    // that number rather than as a message of its own.
+    // that number rather than as a message of its own. The number is written
+    // as a variable width integer, so a small one costs a single byte.
     assert_eq!(
         encode::<dyn Trumps>(&Trumped),
         encode::<dyn Numbered>(&Counted)
@@ -740,12 +741,23 @@ fn view_is_a_thin_handle() {
     assert_copy(&view);
 
     // A view is the bytes of its message and nothing else. Fields are read out
-    // of them on access, so a view is one slice wide whatever its schema holds:
-    // a nested message and a list cost exactly what the message itself does.
+    // of them on access, so a view is one slice wide whatever its schema holds,
+    // and a nested message costs exactly what the message holding it does.
     let handle = size_of::<&[u8]>();
     assert_eq!(size_of_val(&view), handle);
     assert_eq!(size_of_val(&view.address()), handle);
-    assert_eq!(size_of_val(&view.children()), handle);
+
+    // A list is walked rather than read out once, so its handle also carries
+    // what the frame's header said, read where the list was reached rather
+    // than again at every element. It is a constant all the same: a list costs
+    // what it costs however long it is and whatever it holds.
+    let alone = encode::<dyn Person>(&OwnedPerson::new("solo", vec![]));
+    let alone = decode::<dyn Person>(&alone).unwrap();
+    assert_eq!(
+        size_of_val(&view.children()),
+        size_of_val(&alone.children())
+    );
+    assert!(size_of_val(&view.children()) <= 8 * handle);
 
     // Nor does the count of fields change it: five slots cost what three do,
     // and one scalar costs the same again.

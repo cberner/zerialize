@@ -1524,7 +1524,7 @@ fn write_field(
             quote! {
                 let __items = #value;
                 let __length = ::zerialize::List::len(&__items);
-                let __list = __writer.begin_frame(__length);
+                let __list = __writer.begin_list::<#element>(__length);
                 for __index in 0..__length {
                     let __item = ::zerialize::List::get(&__items, __index)
                         .expect("List::get returned None below List::len");
@@ -1794,13 +1794,13 @@ fn generate_schema(schema: &Schema<'_>, derived: Derived) -> TokenStream {
     let checks = methods
         .iter()
         .map(|method| check_field(&method.kind, method.slot));
-    let validate = if methods.is_empty() {
-        TokenStream::new()
-    } else {
-        quote! {
-            if __message.validates() {
-                #(#checks)*
-            }
+    // A message reached from another one was checked to be a message when it
+    // was reached; the outermost one is checked here, so that a buffer holding
+    // an enum is not read as one.
+    let validate = quote! {
+        if __message.validates() {
+            __message.expect_message()?;
+            #(#checks)*
         }
     };
 
@@ -2221,32 +2221,23 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
     let encoded = variants.iter().map(|variant| {
         let tag = Literal::u32_suffixed(variant.tag);
         let pattern = pattern(name, &variant.written, "__field");
-        let payload = if variant.fields.is_empty() {
-            TokenStream::new()
-        } else {
-            let slots = table(variant.fields.iter().map(|field| field.slot));
-            let frame = format_ident!("__payload");
-            let written = variant.fields.iter().enumerate().map(|(index, field)| {
-                let binding = binding("__field", index);
-                write_payload(
-                    &field.payload,
-                    params,
-                    &frame,
-                    field.slot,
-                    &quote!(#binding),
-                )
-            });
-            quote! {
-                let __payload = __writer.begin_payload(&__frame, #slots);
-                #(#written)*
-                __writer.end_frame(__payload);
-            }
-        };
+        let slots = table(variant.fields.iter().map(|field| field.slot));
+        let frame = format_ident!("__payload");
+        let written = variant.fields.iter().enumerate().map(|(index, field)| {
+            let binding = binding("__field", index);
+            write_payload(
+                &field.payload,
+                params,
+                &frame,
+                field.slot,
+                &quote!(#binding),
+            )
+        });
         quote! {
             #pattern => {
-                let __frame = __writer.begin_variant(#tag);
-                #payload
-                __writer.end_frame(__frame);
+                let __payload = __writer.begin_variant(#tag, #slots);
+                #(#written)*
+                __writer.end_frame(__payload);
             }
         }
     });
@@ -2259,14 +2250,15 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
             .map(|field| read_payload(&field.payload, params, field.slot))
             .collect::<Vec<_>>();
         let built = construct(name, &variant.written, &read);
-        // A variant carrying nothing was written without a payload, so there is
-        // none to read here either.
+        // A variant's fields are the entries of the frame carrying its tag, so
+        // there is nothing to reach into: one that carries none simply has no
+        // entries.
         if variant.fields.is_empty() {
             return quote!(#tag => ::core::result::Result::Ok(#built),);
         }
         quote! {
             #tag => {
-                let __payload = __message.read_payload()?;
+                let __payload = __message;
                 ::core::result::Result::Ok(#built)
             }
         }
@@ -2471,7 +2463,7 @@ fn generate_choice(item: &ItemEnum, parsed: &Choice<'_>, derived: Derived) -> To
                 __list: ::zerialize::Message<'buf>,
                 __index: ::core::primitive::u32,
             ) -> ::core::result::Result<Self::Item<'buf>, ::zerialize::Error> {
-                <Self as ::zerialize::Zerializable>::decode_view(__list.read_message(__index)?)
+                <Self as ::zerialize::Zerializable>::decode_view(__list.read_variant(__index)?)
             }
         }
     }
@@ -3074,25 +3066,16 @@ fn generate_enum(name: &Ident, variants: &[Variant<'_>]) -> (TokenStream, TokenS
     let written = variants.iter().map(|variant| {
         let number = Literal::u32_suffixed(variant.number);
         let pattern = pattern(name, &variant.written, "__field");
-        let payload = if variant.fields.is_empty() {
-            TokenStream::new()
-        } else {
-            let slots = table(variant.fields.iter().map(|field| field.slot));
-            let written = variant.fields.iter().enumerate().map(|(index, field)| {
-                let binding = binding("__field", index);
-                write_value(&field.kind, &frame, field.slot, &quote!(*#binding))
-            });
-            quote! {
-                let __payload = __writer.begin_payload(&__frame, #slots);
-                #(#written)*
-                __writer.end_frame(__payload);
-            }
-        };
+        let slots = table(variant.fields.iter().map(|field| field.slot));
+        let written = variant.fields.iter().enumerate().map(|(index, field)| {
+            let binding = binding("__field", index);
+            write_value(&field.kind, &frame, field.slot, &quote!(*#binding))
+        });
         quote! {
             #pattern => {
-                let __frame = __writer.begin_variant(#number);
-                #payload
-                __writer.end_frame(__frame);
+                let __payload = __writer.begin_variant(#number, #slots);
+                #(#written)*
+                __writer.end_frame(__payload);
             }
         }
     });
@@ -3105,14 +3088,15 @@ fn generate_enum(name: &Ident, variants: &[Variant<'_>]) -> (TokenStream, TokenS
             .map(|field| read_value(&field.kind, &frame, field.slot))
             .collect::<Vec<_>>();
         let built = construct(name, &variant.written, &fields);
-        // A variant carrying nothing was written without a payload, so there is
-        // none to read here either.
+        // A variant's fields are the entries of the frame carrying its number,
+        // so there is nothing to reach into: one that carries none simply has
+        // no entries.
         if variant.fields.is_empty() {
             return quote!(#number => ::core::result::Result::Ok(#built),);
         }
         quote! {
             #number => {
-                let __payload = __variant.read_payload()?;
+                let __payload = __variant;
                 ::core::result::Result::Ok(#built)
             }
         }
@@ -3125,7 +3109,7 @@ fn generate_enum(name: &Ident, variants: &[Variant<'_>]) -> (TokenStream, TokenS
             }
         },
         quote! {
-            let __variant = __message.read_message(__slot)?;
+            let __variant = __message.read_variant(__slot)?;
             match __variant.read_tag()? {
                 #(#read)*
                 _ => ::core::result::Result::Err(::zerialize::Error::UnknownVariant),
@@ -3154,10 +3138,10 @@ fn generate_numbered(name: &Ident, variants: &[Variant<'_>]) -> (TokenStream, To
 
     (
         quote! {
-            __writer.write_u32(match __value { #(#written)* });
+            __writer.write_number(match __value { #(#written)* });
         },
         quote! {
-            match __message.read_u32(__slot)? {
+            match __message.read_number(__slot)? {
                 #(#read)*
                 _ => ::core::result::Result::Err(::zerialize::Error::UnknownVariant),
             }

@@ -354,7 +354,7 @@ use std::fmt::{self, Display, Formatter};
 use std::ops::Range;
 
 pub use list::{Copied, Element, List, ListIter, ListView, OwnedList};
-pub use wire::{FrameMark, Message, Writer};
+pub use wire::{FrameMark, Message, Packing, Writer};
 pub use zerialize_macros::{Zerializable, zerializable};
 
 /// Why a buffer could not be decoded as a schema.
@@ -374,6 +374,11 @@ pub enum Error {
     TrailingBytes,
     MissingField,
     RecursionLimit,
+    /// A frame that is not the shape the schema reading it expects: a message
+    /// where an enum belongs, a list of one shape where the other belongs, or
+    /// a frame whose header names a shape this version of the format does not
+    /// have.
+    InvalidFrame,
     /// A variant number no variant of the reader's enum claims. Unlike an
     /// unknown slot, which a reader skips by never asking for it, an enum that
     /// gained a variant cannot be read by a reader built before it.
@@ -390,6 +395,7 @@ impl Display for Error {
             Error::TrailingBytes => "bytes remain after the message",
             Error::MissingField => "required field is absent",
             Error::RecursionLimit => "message is nested deeper than the recursion limit",
+            Error::InvalidFrame => "frame is not the shape this schema expects",
             Error::UnknownVariant => "enum tag names no variant of this schema",
         };
         f.write_str(message)

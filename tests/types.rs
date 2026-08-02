@@ -1163,8 +1163,10 @@ fn a_list_holds_primitives_and_values() {
     assert_eq!(view.weights().get(1).unwrap(), Weight { grams: 6 });
     assert!(view.counts().get(3).is_none());
 
-    // A list of elements is a view of them, the same size as any other list.
-    assert_eq!(size_of_val(&view.counts()), size_of::<&[u8]>());
+    // A list of elements is a view of them, the same size as any other list,
+    // whatever it holds and however long it is.
+    assert_eq!(size_of_val(&view.counts()), size_of_val(&view.names()));
+    assert_eq!(size_of_val(&view.counts()), size_of_val(&view.weights()));
     assert_eq!(view, source);
     assert_eq!(encode::<dyn Inventory>(&view), encoded);
 }
