@@ -10,7 +10,7 @@ exclude = ["benchmarks"]
 # this workspace. The version lives here, and the requirement naming it sits
 # beside it, so a release bumps the two together.
 [workspace.package]
-version = "0.0.0"
+version = "0.0.1"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT OR Apache-2.0"
@@ -18,7 +18,7 @@ repository = "https://github.com/cberner/zerialize"
 authors = ["Christopher Berner <me@cberner.com>"]
 
 [workspace.dependencies]
-zerialize-macros = { version = "0.0.0", path = "macros" }
+zerialize-macros = { version = "0.0.1", path = "macros" }
 
 [package]
 name = "zerialize"
