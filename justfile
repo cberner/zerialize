@@ -40,3 +40,11 @@ coverage:
 
 format:
     cargo fmt --all
+
+# `--workspace` verifies the tarball against the macros crate this workspace is
+# about to publish. A plain `cargo package` rewrites the path dependency to a
+# registry one and checks it against whatever crates.io already holds under that
+# version, which passes or fails for reasons that have nothing to do with the
+# tree being packaged.
+package:
+    cargo package --workspace
