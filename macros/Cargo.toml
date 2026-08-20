@@ -1,12 +1,12 @@
 [package]
 name = "zerialize-macros"
 description = "Procedural macros for zerialize"
-version = "0.0.0"
-edition = "2024"
-rust-version = "1.97"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/cberner/zerialize"
-authors = ["Christopher Berner <me@cberner.com>"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
 
 [lib]
 proc-macro = true
